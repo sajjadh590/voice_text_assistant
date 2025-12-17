@@ -1,0 +1,22 @@
+name: Sync to Hugging Face hub
+on:
+  push:
+    branches: [main] # یا master اگر نام برنچ اصلی شما master است
+
+  # برای اینکه بتوانید دستی هم اجرا کنید
+  workflow_dispatch:
+
+jobs:
+  sync-to-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          lfs: true # اگر فایل‌های بزرگ دارید این خط ضروری است
+
+      - name: Push to hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git push https://sajjadh590:$HF_TOKEN@huggingface.co/spaces/sajjadh590/voice_text_assistant main
