@@ -130,7 +130,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle the /help command."""
-    help_text = """📖 **راهنمای استفاده**
+    help_text = """��� **راهنمای استفاده**
 
 1️⃣ یک فایل صوتی یا ویس ارسال کنید
 2️⃣ از منو نوع پردازش را انتخاب کنید
