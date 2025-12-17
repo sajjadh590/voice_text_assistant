@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                           OMNI-HEAR AI v2.1                                  ║
-║              Bilingual Telegram Bot with Smart Model Cascade                 ║
+║                           OMNI-HEAR AI v2.2                                  ║
+║         Bilingual Telegram Bot with Proxy Support & Smart Cascade            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  🔄 SMART MODEL CASCADE: Auto-switches between models on failure             ║
-║  🧹 MEMORY SAFE: Audio cache cleaned in finally block                        ║
-║  📏 SIZE CHECK: Validates file size before download                          ║
+║  🌐 PROXY SUPPORT: HTTP/SOCKS5 proxy for restricted networks                 ║
+║  🔄 SMART CASCADE: Auto-switches between models on failure                   ║
+║  🧹 MEMORY SAFE: Audio cache cleaned properly                                ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 import os
+import sys
 import logging
 import base64
+import asyncio
 from typing import Optional, List, Tuple
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -23,10 +26,12 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.request import HTTPXRequest
+
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 
-# Configure logging
+# ============== LOGGING ==============
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -37,16 +42,20 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# ============== PROXY CONFIGURATION ==============
+# Supports: http://host:port or socks5://user:pass@host:port
+PROXY_URL = os.getenv("PROXY_URL")  # Example: "socks5://127.0.0.1:1080"
+
 # Configure Gemini
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ============== SMART MODEL CASCADE ==============
+# ============== MODEL CASCADE ==============
 MODEL_PRIORITY: List[str] = [
-    "gemini-2.5-flash-preview-05-20",  # Latest Gemini 2.5
-    "gemini-2.0-flash",                 # Fast and capable
-    "gemini-1.5-pro",                   # Stable pro version
-    "gemini-1.5-flash",                 # Reliable fallback
+    "gemini-2.5-flash-preview-05-20",
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
 ]
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
@@ -83,7 +92,7 @@ If it contains speech: Provide a verbatim transcription in original language.
 Format the output cleanly with proper line breaks."""
 }
 
-# Persian messages
+# ============== PERSIAN MESSAGES ==============
 MESSAGES = {
     "welcome": """🎧 **به Omni-Hear AI خوش آمدید!**
 
@@ -95,7 +104,8 @@ MESSAGES = {
 • 📝 خلاصه متن (فارسی)
 • 🎵 متن آهنگ
 
-🔄 مجهز به Smart Model Cascade""",
+🔄 مجهز به Smart Model Cascade
+🌐 پشتیبانی از Proxy""",
     "audio_received": "🎵 فایل دریافت شد!\n\n📋 نوع پردازش را انتخاب کنید:",
     "processing": "⏳ در حال پردازش...",
     "error": "❌ خطا در پردازش. لطفاً دوباره تلاش کنید.",
@@ -103,14 +113,15 @@ MESSAGES = {
     "no_audio": "⚠️ لطفاً ابتدا یک فایل صوتی ارسال کنید.",
     "file_too_large": "⚠️ حجم فایل بیشتر از ۲۰ مگابایت است.",
     "not_audio": "⚠️ لطفاً یک فایل صوتی ارسال کنید.",
+    "network_error": "🌐 خطای اتصال به شبکه. لطفاً Proxy را بررسی کنید.",
 }
 
-# Store user audio files temporarily
+# Audio cache
 user_audio_cache: dict = {}
 
 
 def get_menu_keyboard() -> InlineKeyboardMarkup:
-    """Create the Persian inline keyboard menu."""
+    """Create Persian inline keyboard menu."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📚 درسنامه کامل", callback_data="lecture"),
@@ -124,13 +135,13 @@ def get_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /start command."""
+    """Handle /start command."""
     await update.message.reply_text(MESSAGES["welcome"], parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /help command."""
-    help_text = """��� **راهنمای استفاده**
+    """Handle /help command."""
+    help_text = """📖 **راهنمای استفاده**
 
 1️⃣ یک فایل صوتی یا ویس ارسال کنید
 2️⃣ از منو نوع پردازش را انتخاب کنید
@@ -151,7 +162,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     msg = update.message
     
-    # ============== FIXED: Safe document check ==============
+    # Detect audio type
     audio_file = None
     file_type = "audio"
     
@@ -161,7 +172,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     elif msg.audio:
         audio_file = msg.audio
     elif msg.document:
-        # Check if document exists AND has audio mime type
         if msg.document.mime_type and msg.document.mime_type.startswith("audio/"):
             audio_file = msg.document
         else:
@@ -171,7 +181,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text(MESSAGES["not_audio"])
         return
     
-    # ============== FILE SIZE CHECK (before download) ==============
+    # File size check
     file_size = getattr(audio_file, 'file_size', 0)
     if file_size and file_size > MAX_FILE_SIZE:
         logger.warning(f"User {user_id}: file too large ({file_size} bytes)")
@@ -181,7 +191,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         file = await context.bot.get_file(audio_file.file_id)
         
-        # Double-check size after get_file
         if file.file_size and file.file_size > MAX_FILE_SIZE:
             await msg.reply_text(MESSAGES["file_too_large"])
             return
@@ -216,8 +225,7 @@ async def process_with_cascade(
     mode: str
 ) -> Tuple[Optional[str], Optional[str]]:
     """
-    🔄 SMART MODEL CASCADE
-    Tries each model in priority order until one succeeds.
+    Smart Model Cascade - tries each model until one succeeds.
     """
     audio_b64 = base64.standard_b64encode(audio_data).decode("utf-8")
     
@@ -230,7 +238,8 @@ async def process_with_cascade(
                 system_instruction=PROMPTS.get(mode, PROMPTS["summary"])
             )
             
-            response = model.generate_content(
+            response = await asyncio.to_thread(
+                model.generate_content,
                 [
                     {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
                     "Process this audio according to your instructions."
@@ -267,7 +276,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(MESSAGES["no_audio"])
         return
     
-    # ============== MEMORY LEAK FIX: try/finally ==============
     try:
         audio_info = user_audio_cache[user_id]
         
@@ -291,15 +299,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if result:
             full_text = f"✅ **پردازش کامل شد**\n\n{result}\n\n---\n🤖 `{model_used}`"
             
-            # Handle long messages (Telegram limit: 4096 chars)
+            # Handle long messages
             if len(full_text) > 4000:
-                # First chunk via edit
                 try:
                     await query.edit_message_text(full_text[:4000], parse_mode="Markdown")
                 except Exception:
                     await query.edit_message_text(full_text[:4000])
                 
-                # Remaining chunks as new messages
                 remaining = full_text[4000:]
                 while remaining:
                     chunk = remaining[:4000]
@@ -331,7 +337,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pass
     
     finally:
-        # ============== CRITICAL: Always cleanup ==============
+        # Cleanup cache
         if user_id in user_audio_cache:
             del user_audio_cache[user_id]
             logger.info(f"🧹 Cache cleaned: user={user_id}")
@@ -347,18 +353,37 @@ def main() -> None:
     # Validate tokens
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN not set!")
-        print("Export it: export TELEGRAM_BOT_TOKEN='your_token'")
-        return
+        print("\n⚠️  Please set environment variables:")
+        print("   export TELEGRAM_BOT_TOKEN='your_bot_token'")
+        print("   export GEMINI_API_KEY='your_gemini_key'")
+        print("   export PROXY_URL='socks5://host:port'  # Optional\n")
+        sys.exit(1)
     
     if not GEMINI_API_KEY:
         logger.error("❌ GEMINI_API_KEY not set!")
-        print("Export it: export GEMINI_API_KEY='your_key'")
-        return
+        sys.exit(1)
     
     logger.info("🔄 Model Cascade: " + " → ".join(MODEL_PRIORITY))
     
-    # Build application
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # ============== BUILD WITH PROXY SUPPORT ==============
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+    
+    if PROXY_URL:
+        logger.info(f"🌐 Using proxy: {PROXY_URL[:20]}...")
+        # Create custom request with proxy
+        request = HTTPXRequest(
+            proxy=PROXY_URL,
+            connect_timeout=30.0,
+            read_timeout=60.0,
+            write_timeout=60.0,
+            pool_timeout=60.0,
+        )
+        builder = builder.request(request)
+        builder = builder.get_updates_request(HTTPXRequest(proxy=PROXY_URL))
+    else:
+        logger.info("🌐 No proxy configured. Direct connection.")
+    
+    app = builder.build()
     
     # Add handlers
     app.add_handler(CommandHandler("start", start_command))
@@ -371,8 +396,8 @@ def main() -> None:
     app.add_error_handler(error_handler)
     
     # Run
-    logger.info("🚀 Starting Omni-Hear AI v2.1...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("🚀 Starting Omni-Hear AI v2.2...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
