@@ -58,6 +58,10 @@ MODEL_PRIORITY: List[str] = [
     "gemini-3.0-flash",           # ⚡ Fastest (Released Dec 16, 2025)
     "gemini-2.5-flash",           # 🛡️ Stable Backup
     "gemini-2.5-pro",             # 🧠 High Intelligence Backup
+    "gemini-2.0-flash-exp",      # ✅ جدیدترین مدل فعال و رایگان گوگل (بسیار سریع و هوشمند)
+    "gemini-1.5-flash",          # ✅ پایدارترین نسخه (مخصوص پروداکشن)
+    "gemini-1.5-pro",            # ✅ هوشمندترین نسخه پایدار
+    "gemini-1.5-flash-8b",       # ✅ نسخه سبک و سریع
 ]
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
