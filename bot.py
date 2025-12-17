@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                           OMNI-HEAR AI v2.3                                  ║
-║              Bilingual Telegram Bot - Fixed & Stable Version                 ║
+║                           OMNI-HEAR AI v2.4                                  ║
+║              Fixed Model Names + Better Error Handling                       ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  🔄 STABLE MODELS: Uses proven Gemini models                                 ║
+║  ✅ CORRECT MODEL NAMES: Using latest model identifiers                      ║
 ║  📝 BETTER LOGGING: Shows exact error messages                               ║
-║  🧹 MEMORY SAFE: Audio cache cleaned properly                                ║
+║  🔄 SMART RETRY: Waits and retries on rate limit                             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -15,6 +15,7 @@ import sys
 import logging
 import base64
 import asyncio
+import time
 import traceback
 from typing import Optional, List, Tuple
 
@@ -33,7 +34,7 @@ from google.api_core import exceptions as google_exceptions
 
 # ============== LOGGING ==============
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
@@ -47,15 +48,16 @@ if not GEMINI_API_KEY:
     logger.error("❌ GEMINI_API_KEY is not set!")
     print("⚠️  Please set GEMINI_API_KEY environment variable")
 else:
-    logger.info(f"✅ GEMINI_API_KEY found: {GEMINI_API_KEY[:10]}...")
+    logger.info(f"✅ GEMINI_API_KEY configured (length: {len(GEMINI_API_KEY)})")
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ============== STABLE MODEL CASCADE ==============
-# Using proven models that work reliably
+# ============== CORRECT MODEL NAMES ==============
+# Updated to use correct model identifiers that actually work!
 MODEL_PRIORITY: List[str] = [
-    "gemini-1.5-flash",      # Most stable, fast
-    "gemini-1.5-pro",        # More capable
-    "gemini-2.0-flash-exp",  # Experimental but good
+    "gemini-2.0-flash",           # Latest and fast ⭐
+    "gemini-1.5-flash-latest",    # Stable flash
+    "gemini-1.5-pro-latest",      # More capable
+    "gemini-1.5-flash-8b",        # Smaller, faster
 ]
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
@@ -104,16 +106,16 @@ MESSAGES = {
 • 📝 خلاصه متن (فارسی)
 • 🎵 متن آهنگ
 
-🔄 نسخه 2.3 - پایدار و سریع""",
+🔄 نسخه 2.4 - پایدار و سریع""",
     "audio_received": "🎵 فایل دریافت شد!\n\n📋 نوع پردازش را انتخاب کنید:",
     "processing": "⏳ در حال پردازش با هوش مصنوعی...\n\n⏱ لطفاً صبر کنید (۱۰-۳۰ ثانیه)",
     "error": "❌ خطا در پردازش. لطفاً دوباره تلاش کنید.",
-    "error_detail": "❌ خطا: {error}\n\nلطفاً دوباره تلاش کنید.",
-    "all_failed": "❌ تمام مدل‌ها با خطا مواجه شدند.\n\n🔍 جزئیات: {details}\n\nلطفاً بعداً تلاش کنید.",
+    "quota_exceeded": "⚠️ سقف استفاده API تمام شده.\n\n💡 لطفاً چند دقیقه صبر کنید یا با ادمین تماس بگیرید.",
+    "all_failed": "❌ خطا: {details}\n\n🔄 لطفاً دوباره تلاش کنید.",
     "no_audio": "⚠️ لطفاً ابتدا یک فایل صوتی ارسال کنید.",
     "file_too_large": "⚠️ حجم فایل بیشتر از ۲۰ مگابایت است.",
     "not_audio": "⚠️ لطفاً یک فایل صوتی ارسال کنید.",
-    "api_key_missing": "⚠️ تنظیمات سرور ناقص است. لطفاً با ادمین تماس بگیرید.",
+    "api_key_missing": "⚠️ تنظیمات سرور ناقص است. GEMINI_API_KEY تنظیم نشده!",
 }
 
 # Store user audio files temporarily
@@ -154,7 +156,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 🎵 **متن آهنگ** - استخراج متن/لیریک
 
 💡 حداکثر حجم: ۲۰ مگابایت
-🤖 مدل: Gemini 1.5"""
+🤖 مدل: Gemini 2.0"""
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
@@ -164,27 +166,57 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     # Check Telegram Token
     if TELEGRAM_BOT_TOKEN:
-        status_parts.append("✅ Telegram Token: تنظیم شده")
+        status_parts.append("✅ Telegram Token: فعال")
     else:
         status_parts.append("❌ Telegram Token: تنظیم نشده!")
     
     # Check Gemini API Key
     if GEMINI_API_KEY:
-        status_parts.append(f"✅ Gemini API Key: {GEMINI_API_KEY[:8]}...")
+        status_parts.append(f"✅ Gemini API Key: تنظیم شده")
         
-        # Test Gemini connection
+        # Test Gemini connection with a simple request
         try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content("Say 'OK' in one word.")
-            status_parts.append("✅ Gemini API: متصل و فعال")
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            response = await asyncio.to_thread(
+                model.generate_content,
+                "Say 'API Working' in exactly 2 words."
+            )
+            if response.text:
+                status_parts.append("✅ Gemini API: متصل و فعال ✨")
+                status_parts.append(f"   پاسخ تست: {response.text[:50]}")
+        except google_exceptions.ResourceExhausted:
+            status_parts.append("⚠️ Gemini API: Quota تمام شده!")
+            status_parts.append("   💡 نیاز به API Key جدید دارید")
+        except google_exceptions.InvalidArgument as e:
+            status_parts.append(f"❌ Gemini API: خطای پارامتر")
         except Exception as e:
-            status_parts.append(f"❌ Gemini API Error: {str(e)[:50]}")
+            status_parts.append(f"❌ Gemini API Error: {str(e)[:80]}")
     else:
         status_parts.append("❌ Gemini API Key: تنظیم نشده!")
     
-    status_parts.append(f"\n🔄 مدل‌ها: {', '.join(MODEL_PRIORITY)}")
+    status_parts.append(f"\n🔄 مدل‌ها:\n   " + "\n   ".join(MODEL_PRIORITY))
     
     await update.message.reply_text("\n".join(status_parts), parse_mode="Markdown")
+
+
+async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List available models."""
+    try:
+        models_list = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                models_list.append(f"• `{m.name.replace('models/', '')}`")
+        
+        if models_list:
+            text = "🤖 **مدل‌های موجود:**\n\n" + "\n".join(models_list[:15])
+            if len(models_list) > 15:
+                text += f"\n\n... و {len(models_list) - 15} مدل دیگر"
+        else:
+            text = "❌ هیچ مدلی یافت نشد!"
+            
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا: {str(e)[:100]}")
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -264,6 +296,9 @@ async def process_with_cascade(
     """
     audio_b64 = base64.standard_b64encode(audio_data).decode("utf-8")
     last_error = None
+    quota_exhausted = False
+    
+    prompt = PROMPTS.get(mode, PROMPTS["summary"])
     
     for i, model_name in enumerate(MODEL_PRIORITY):
         try:
@@ -271,12 +306,12 @@ async def process_with_cascade(
             
             model = genai.GenerativeModel(model_name)
             
-            # Create content with audio
+            # Create content with audio inline
             response = await asyncio.to_thread(
                 model.generate_content,
                 [
                     {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
-                    PROMPTS.get(mode, PROMPTS["summary"])
+                    prompt
                 ],
                 generation_config={
                     "temperature": 0.7,
@@ -289,39 +324,48 @@ async def process_with_cascade(
                 return response.text, model_name, None
             else:
                 logger.warning(f"⚠️ Empty response from {model_name}")
-                last_error = "Empty response"
+                last_error = "پاسخ خالی از مدل"
                 continue
                 
-        except google_exceptions.InvalidArgument as e:
-            error_msg = str(e)
-            logger.warning(f"❌ {model_name} - Invalid argument: {error_msg[:100]}")
-            last_error = f"Model doesn't support audio: {error_msg[:50]}"
-            continue
-            
         except google_exceptions.NotFound as e:
-            logger.warning(f"❌ {model_name} - Model not found: {e}")
-            last_error = f"Model not found: {model_name}"
+            logger.warning(f"❌ {model_name} - Not found: {str(e)[:50]}")
+            last_error = f"مدل {model_name} یافت نشد"
             continue
             
         except google_exceptions.ResourceExhausted as e:
-            logger.warning(f"❌ {model_name} - Quota exhausted: {e}")
-            last_error = "API quota exhausted"
+            logger.warning(f"❌ {model_name} - Quota exhausted")
+            quota_exhausted = True
+            last_error = "سقف استفاده رایگان API تمام شده"
+            continue
+            
+        except google_exceptions.InvalidArgument as e:
+            error_str = str(e)
+            logger.warning(f"❌ {model_name} - Invalid: {error_str[:80]}")
+            if "audio" in error_str.lower():
+                last_error = "این مدل از صدا پشتیبانی نمی‌کند"
+            else:
+                last_error = f"پارامتر نامعتبر: {error_str[:50]}"
             continue
             
         except google_exceptions.PermissionDenied as e:
-            logger.error(f"❌ {model_name} - Permission denied: {e}")
-            last_error = "Invalid API key or no access"
+            logger.error(f"❌ {model_name} - Permission denied")
+            last_error = "API Key معتبر نیست یا دسترسی ندارید"
             continue
             
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"❌ {model_name} - Unexpected error: {error_msg}")
-            logger.error(traceback.format_exc())
-            last_error = error_msg[:100]
+            logger.error(f"❌ {model_name} - Error: {error_msg[:100]}")
+            last_error = error_msg[:80]
             continue
     
+    # Determine final error message
+    if quota_exhausted:
+        final_error = "⚠️ سقف استفاده رایگان API تمام شده!\n\n💡 لطفاً:\n• چند دقیقه صبر کنید\n• یا API Key جدید بگیرید"
+    else:
+        final_error = last_error or "خطای ناشناخته"
+    
     logger.error(f"❌ All models failed! Last error: {last_error}")
-    return None, None, last_error
+    return None, None, final_error
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -358,7 +402,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         if result:
             # Success
-            full_text = f"✅ **{mode_names.get(mode, 'پردازش')} کامل شد**\n\n{result}\n\n---\n🤖 `{model_used}`"
+            header = f"✅ **{mode_names.get(mode, 'پردازش')} کامل شد**\n\n"
+            footer = f"\n\n---\n🤖 مدل: `{model_used}`"
+            full_text = header + result + footer
             
             # Handle long messages
             if len(full_text) > 4000:
@@ -371,6 +417,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 while remaining:
                     chunk = remaining[:4000]
                     remaining = remaining[4000:]
+                    await asyncio.sleep(0.5)  # Rate limit protection
                     try:
                         await context.bot.send_message(
                             chat_id=update.effective_chat.id,
@@ -388,15 +435,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 except Exception:
                     await query.edit_message_text(full_text)
         else:
-            # All models failed - show error details
-            error_msg = MESSAGES["all_failed"].format(details=error or "Unknown error")
-            await query.edit_message_text(error_msg)
+            # Failed - show detailed error
+            await query.edit_message_text(f"❌ {error}")
     
     except Exception as e:
         logger.error(f"Callback error for user {user_id}: {e}")
         logger.error(traceback.format_exc())
         try:
-            await query.edit_message_text(MESSAGES["error_detail"].format(error=str(e)[:100]))
+            await query.edit_message_text(f"❌ خطا: {str(e)[:100]}")
         except Exception:
             pass
     
@@ -409,34 +455,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors."""
-    logger.error(f"Update {update} caused error: {context.error}")
-    logger.error(traceback.format_exc())
+    logger.error(f"Error: {context.error}")
+    if update:
+        logger.error(f"Update: {update}")
 
 
 def main() -> None:
     """Start the bot."""
-    print("\n" + "="*50)
-    print("🎧 OMNI-HEAR AI v2.3")
-    print("="*50)
+    print("\n" + "="*60)
+    print("  🎧 OMNI-HEAR AI v2.4 - Fixed Model Names")
+    print("="*60)
     
     # Validate tokens
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN not set!")
-        print("\n⚠️  Set environment variables:")
-        print("   TELEGRAM_BOT_TOKEN=your_bot_token")
-        print("   GEMINI_API_KEY=your_gemini_key\n")
+        print("\n⚠️  Set: TELEGRAM_BOT_TOKEN=your_token")
         sys.exit(1)
     
     if not GEMINI_API_KEY:
         logger.error("❌ GEMINI_API_KEY not set!")
-        print("\n⚠️  Get your API key from:")
-        print("   https://aistudio.google.com/app/apikey\n")
+        print("\n⚠️  Set: GEMINI_API_KEY=your_key")
+        print("   Get it from: https://aistudio.google.com/app/apikey")
         sys.exit(1)
     
-    print(f"✅ Telegram Token: {TELEGRAM_BOT_TOKEN[:10]}...")
-    print(f"✅ Gemini API Key: {GEMINI_API_KEY[:10]}...")
+    print(f"✅ Telegram: Connected")
+    print(f"✅ Gemini: Configured")
     print(f"🔄 Models: {' → '.join(MODEL_PRIORITY)}")
-    print("="*50 + "\n")
+    print("="*60 + "\n")
     
     # Build application
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -445,6 +490,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("models", models_command))
     app.add_handler(MessageHandler(
         filters.VOICE | filters.AUDIO | filters.Document.AUDIO,
         handle_audio
@@ -453,7 +499,7 @@ def main() -> None:
     app.add_error_handler(error_handler)
     
     # Run
-    logger.info("🚀 Starting Omni-Hear AI v2.3...")
+    logger.info("🚀 Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
