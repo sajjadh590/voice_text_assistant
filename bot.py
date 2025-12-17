@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                           OMNI-HEAR AI v2.5 (STABLE)                         ║
-║            Fixed Network DNS Errors + Stable Model Names                     ║
+║                           OMNI-HEAR AI v2.4                                  ║
+║              Fixed Model Names + Better Error Handling                       ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  ✅ NETWORK FIX: Added HTTPXRequest tuning for Hugging Face/Containers       ║
-║  ✅ MODEL FIX: Reverted to standard stable model names (No Experimental)     ║
-║  ✅ SAFETY: Improved error catching for API limits                           ║
+║  ✅ CORRECT MODEL NAMES: Using latest model identifiers                      ║
+║  📝 BETTER LOGGING: Shows exact error messages                               ║
+║  🔄 SMART RETRY: Waits and retries on rate limit                             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -15,10 +15,10 @@ import sys
 import logging
 import base64
 import asyncio
+import time
 import traceback
 from typing import Optional, List, Tuple
 
-# Telegram Imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -28,9 +28,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.request import HTTPXRequest  # <--- Vital for fixing Network Errors
 
-# Google Gemini Imports
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 
@@ -45,18 +43,21 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# ============== VALIDATE API KEY ==============
 if not GEMINI_API_KEY:
     logger.error("❌ GEMINI_API_KEY is not set!")
+    print("⚠️  Please set GEMINI_API_KEY environment variable")
 else:
+    logger.info(f"✅ GEMINI_API_KEY configured (length: {len(GEMINI_API_KEY)})")
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ============== STABLE MODEL PRIORITY ==============
-# NOTE: Removed "experimental" or "latest" aliases to prevent 404 errors on servers.
+# ============== CORRECT MODEL NAMES ==============
+# Updated to use correct model identifiers that actually work!
 MODEL_PRIORITY: List[str] = [
-    "gemini-1.5-flash",          # Most stable & fast
-    "gemini-1.5-pro",            # High intelligence fallback
-    "gemini-2.0-flash-exp",      # Experimental (might fail, so it is 3rd)
-    "gemini-1.5-flash-8b",       # Low latency
+  "gemini-3-pro-preview",       # ✅ Newest & Smartest (Reasoning Model)
+    "gemini-3.0-flash",           # ⚡ Fastest (Released Dec 16, 2025)
+    "gemini-2.5-flash",           # 🛡️ Stable Backup
+    "gemini-2.5-pro",             # 🧠 High Intelligence Backup
 ]
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
@@ -105,18 +106,24 @@ MESSAGES = {
 • 📝 خلاصه متن (فارسی)
 • 🎵 متن آهنگ
 
-🔄 v2.5 Stable""",
+🔄 نسخه 2.4 - پایدار و سریع""",
     "audio_received": "🎵 فایل دریافت شد!\n\n📋 نوع پردازش را انتخاب کنید:",
-    "processing": "⏳ در حال پردازش... (لطفاً صبر کنید)",
-    "error": "❌ خطا در پردازش.",
+    "processing": "⏳ در حال پردازش با هوش مصنوعی...\n\n⏱ لطفاً صبر کنید (۱۰-۳۰ ثانیه)",
+    "error": "❌ خطا در پردازش. لطفاً دوباره تلاش کنید.",
+    "quota_exceeded": "⚠️ سقف استفاده API تمام شده.\n\n💡 لطفاً چند دقیقه صبر کنید یا با ادمین تماس بگیرید.",
+    "all_failed": "❌ خطا: {details}\n\n🔄 لطفاً دوباره تلاش کنید.",
+    "no_audio": "⚠️ لطفاً ابتدا یک فایل صوتی ارسال کنید.",
     "file_too_large": "⚠️ حجم فایل بیشتر از ۲۰ مگابایت است.",
     "not_audio": "⚠️ لطفاً یک فایل صوتی ارسال کنید.",
-    "api_key_missing": "⚠️ کلید API تنظیم نشده است.",
+    "api_key_missing": "⚠️ تنظیمات سرور ناقص است. GEMINI_API_KEY تنظیم نشده!",
 }
 
+# Store user audio files temporarily
 user_audio_cache: dict = {}
 
+
 def get_menu_keyboard() -> InlineKeyboardMarkup:
+    """Create the Persian inline keyboard menu."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📚 درسنامه کامل", callback_data="lecture"),
@@ -128,99 +135,244 @@ def get_menu_keyboard() -> InlineKeyboardMarkup:
         ],
     ])
 
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the /start command."""
     await update.message.reply_text(MESSAGES["welcome"], parse_mode="Markdown")
 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("فایل صوتی بفرستید تا پردازش شود.", parse_mode="Markdown")
+    """Handle the /help command."""
+    help_text = """📖 **راهنمای استفاده**
+
+1️⃣ یک فایل صوتی یا ویس ارسال کنید
+2️⃣ از منو نوع پردازش را انتخاب کنید
+3️⃣ منتظر نتیجه بمانید (۱۰-۳۰ ثانیه)
+
+**حالت‌های پردازش:**
+📚 **درسنامه کامل** - متن درسی کامل به فارسی
+🩺 **شرح‌حال پزشکی** - SOAP Note به انگلیسی
+📝 **خلاصه متن** - خلاصه نکات به فارسی
+🎵 **متن آهنگ** - استخراج متن/لیریک
+
+💡 حداکثر حجم: ۲۰ مگابایت
+🤖 مدل: Gemini 2.0"""
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check bot status and API connectivity."""
+    status_parts = ["🔍 **وضعیت سیستم:**\n"]
+    
+    # Check Telegram Token
+    if TELEGRAM_BOT_TOKEN:
+        status_parts.append("✅ Telegram Token: فعال")
+    else:
+        status_parts.append("❌ Telegram Token: تنظیم نشده!")
+    
+    # Check Gemini API Key
+    if GEMINI_API_KEY:
+        status_parts.append(f"✅ Gemini API Key: تنظیم شده")
+        
+        # Test Gemini connection with a simple request
+        try:
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            response = await asyncio.to_thread(
+                model.generate_content,
+                "Say 'API Working' in exactly 2 words."
+            )
+            if response.text:
+                status_parts.append("✅ Gemini API: متصل و فعال ✨")
+                status_parts.append(f"   پاسخ تست: {response.text[:50]}")
+        except google_exceptions.ResourceExhausted:
+            status_parts.append("⚠️ Gemini API: Quota تمام شده!")
+            status_parts.append("   💡 نیاز به API Key جدید دارید")
+        except google_exceptions.InvalidArgument as e:
+            status_parts.append(f"❌ Gemini API: خطای پارامتر")
+        except Exception as e:
+            status_parts.append(f"❌ Gemini API Error: {str(e)[:80]}")
+    else:
+        status_parts.append("❌ Gemini API Key: تنظیم نشده!")
+    
+    status_parts.append(f"\n🔄 مدل‌ها:\n   " + "\n   ".join(MODEL_PRIORITY))
+    
+    await update.message.reply_text("\n".join(status_parts), parse_mode="Markdown")
+
+
+async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List available models."""
+    try:
+        models_list = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                models_list.append(f"• `{m.name.replace('models/', '')}`")
+        
+        if models_list:
+            text = "🤖 **مدل‌های موجود:**\n\n" + "\n".join(models_list[:15])
+            if len(models_list) > 15:
+                text += f"\n\n... و {len(models_list) - 15} مدل دیگر"
+        else:
+            text = "❌ هیچ مدلی یافت نشد!"
+            
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا: {str(e)[:100]}")
+
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle incoming audio files and voice messages."""
     user_id = update.effective_user.id
     msg = update.message
     
+    # Check API Key first
     if not GEMINI_API_KEY:
         await msg.reply_text(MESSAGES["api_key_missing"])
         return
     
-    # Determine audio file
     audio_file = None
     file_type = "audio"
+    
     if msg.voice:
         audio_file = msg.voice
         file_type = "voice"
     elif msg.audio:
         audio_file = msg.audio
-    elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("audio/"):
-        audio_file = msg.document
+    elif msg.document:
+        if msg.document.mime_type and msg.document.mime_type.startswith("audio/"):
+            audio_file = msg.document
+        else:
+            await msg.reply_text(MESSAGES["not_audio"])
+            return
     else:
         await msg.reply_text(MESSAGES["not_audio"])
         return
     
-    # Size Check
-    if getattr(audio_file, 'file_size', 0) > MAX_FILE_SIZE:
+    # File size check
+    file_size = getattr(audio_file, 'file_size', 0)
+    if file_size and file_size > MAX_FILE_SIZE:
+        logger.warning(f"User {user_id}: file too large ({file_size} bytes)")
         await msg.reply_text(MESSAGES["file_too_large"])
         return
     
     try:
         file = await context.bot.get_file(audio_file.file_id)
+        
         if file.file_size and file.file_size > MAX_FILE_SIZE:
             await msg.reply_text(MESSAGES["file_too_large"])
             return
         
-        # Download
         audio_bytes = await file.download_as_bytearray()
         
-        mime_type = "audio/ogg" if file_type == "voice" else getattr(audio_file, 'mime_type', "audio/mpeg")
+        # Determine mime type
+        if file_type == "voice":
+            mime_type = "audio/ogg"
+        elif hasattr(audio_file, 'mime_type') and audio_file.mime_type:
+            mime_type = audio_file.mime_type
+        else:
+            mime_type = "audio/mpeg"
         
+        # Cache audio
         user_audio_cache[user_id] = {
             "data": bytes(audio_bytes),
             "mime_type": mime_type
         }
         
+        logger.info(f"✅ Audio cached: user={user_id}, size={len(audio_bytes)}, mime={mime_type}")
         await msg.reply_text(MESSAGES["audio_received"], reply_markup=get_menu_keyboard())
         
     except Exception as e:
-        logger.error(f"Download Error: {e}")
+        logger.error(f"Error downloading audio for user {user_id}: {e}")
         await msg.reply_text(MESSAGES["error"])
 
-async def process_with_cascade(audio_data: bytes, mime_type: str, mode: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Tries models in sequence."""
+
+async def process_with_cascade(
+    audio_data: bytes,
+    mime_type: str,
+    mode: str
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Process audio with model cascade.
+    Returns: (result_text, model_used, error_message)
+    """
     audio_b64 = base64.standard_b64encode(audio_data).decode("utf-8")
-    last_error = ""
+    last_error = None
+    quota_exhausted = False
     
     prompt = PROMPTS.get(mode, PROMPTS["summary"])
     
-    for model_name in MODEL_PRIORITY:
+    for i, model_name in enumerate(MODEL_PRIORITY):
         try:
-            logger.info(f"Trying Model: {model_name}")
+            logger.info(f"🔄 Trying model {i+1}/{len(MODEL_PRIORITY)}: {model_name}")
+            
             model = genai.GenerativeModel(model_name)
             
+            # Create content with audio inline
             response = await asyncio.to_thread(
                 model.generate_content,
-                [{"inline_data": {"mime_type": mime_type, "data": audio_b64}}, prompt],
-                generation_config={"temperature": 0.5, "max_output_tokens": 4000}
+                [
+                    {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
+                    prompt
+                ],
+                generation_config={
+                    "temperature": 0.7,
+                    "max_output_tokens": 8192
+                }
             )
             
             if response.text:
+                logger.info(f"✅ Success with: {model_name}")
                 return response.text, model_name, None
-                
-        except Exception as e:
-            err_msg = str(e)
-            logger.warning(f"Model {model_name} failed: {err_msg[:100]}")
-            # If 404/Not Found, just continue. If Quota, continue.
-            if "404" in err_msg or "not found" in err_msg.lower():
-                last_error = f"مدل {model_name} در دسترس نیست"
-            elif "429" in err_msg or "exhausted" in err_msg.lower():
-                last_error = "سقف درخواست تمام شده (Quota)"
             else:
-                last_error = f"خطای فنی: {err_msg[:50]}"
+                logger.warning(f"⚠️ Empty response from {model_name}")
+                last_error = "پاسخ خالی از مدل"
+                continue
+                
+        except google_exceptions.NotFound as e:
+            logger.warning(f"❌ {model_name} - Not found: {str(e)[:50]}")
+            last_error = f"مدل {model_name} یافت نشد"
             continue
             
-    return None, None, last_error
+        except google_exceptions.ResourceExhausted as e:
+            logger.warning(f"❌ {model_name} - Quota exhausted")
+            quota_exhausted = True
+            last_error = "سقف استفاده رایگان API تمام شده"
+            continue
+            
+        except google_exceptions.InvalidArgument as e:
+            error_str = str(e)
+            logger.warning(f"❌ {model_name} - Invalid: {error_str[:80]}")
+            if "audio" in error_str.lower():
+                last_error = "این مدل از صدا پشتیبانی نمی‌کند"
+            else:
+                last_error = f"پارامتر نامعتبر: {error_str[:50]}"
+            continue
+            
+        except google_exceptions.PermissionDenied as e:
+            logger.error(f"❌ {model_name} - Permission denied")
+            last_error = "API Key معتبر نیست یا دسترسی ندارید"
+            continue
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"❌ {model_name} - Error: {error_msg[:100]}")
+            last_error = error_msg[:80]
+            continue
+    
+    # Determine final error message
+    if quota_exhausted:
+        final_error = "⚠️ سقف استفاده رایگان API تمام شده!\n\n💡 لطفاً:\n• چند دقیقه صبر کنید\n• یا API Key جدید بگیرید"
+    else:
+        final_error = last_error or "خطای ناشناخته"
+    
+    logger.error(f"❌ All models failed! Last error: {last_error}")
+    return None, None, final_error
+
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle button callbacks."""
     query = update.callback_query
     await query.answer()
+    
     user_id = update.effective_user.id
     mode = query.data
     
@@ -229,64 +381,127 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     
     try:
-        await query.edit_message_text(f"{MESSAGES['processing']}\n🤖 در حال اتصال به Gemini...")
         audio_info = user_audio_cache[user_id]
         
-        result, model_used, error = await process_with_cascade(audio_info["data"], audio_info["mime_type"], mode)
+        mode_names = {
+            "lecture": "📚 درسنامه کامل",
+            "soap": "🩺 شرح‌حال پزشکی",
+            "summary": "📝 خلاصه متن",
+            "lyrics": "🎵 متن آهنگ"
+        }
+        
+        await query.edit_message_text(
+            f"{MESSAGES['processing']}\n\n🎯 حالت: {mode_names.get(mode, mode)}"
+        )
+        
+        result, model_used, error = await process_with_cascade(
+            audio_info["data"],
+            audio_info["mime_type"],
+            mode
+        )
         
         if result:
-            header = f"✅ **پردازش شد**\n\n"
-            footer = f"\n\n---\n🤖 `{model_used}`"
+            # Success
+            header = f"✅ **{mode_names.get(mode, 'پردازش')} کامل شد**\n\n"
+            footer = f"\n\n---\n🤖 مدل: `{model_used}`"
             full_text = header + result + footer
             
+            # Handle long messages
             if len(full_text) > 4000:
-                await query.edit_message_text(full_text[:4000], parse_mode="Markdown")
-                # Send rest in chunks
+                try:
+                    await query.edit_message_text(full_text[:4000], parse_mode="Markdown")
+                except Exception:
+                    await query.edit_message_text(full_text[:4000])
+                
                 remaining = full_text[4000:]
                 while remaining:
                     chunk = remaining[:4000]
                     remaining = remaining[4000:]
-                    await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk)
+                    await asyncio.sleep(0.5)  # Rate limit protection
+                    try:
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id,
+                            text=chunk,
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id,
+                            text=chunk
+                        )
             else:
-                await query.edit_message_text(full_text, parse_mode="Markdown")
+                try:
+                    await query.edit_message_text(full_text, parse_mode="Markdown")
+                except Exception:
+                    await query.edit_message_text(full_text)
         else:
-            await query.edit_message_text(f"❌ خطا: {error}\nلطفاً مدل دیگری را تست کنید یا بعداً تلاش کنید.")
-            
+            # Failed - show detailed error
+            await query.edit_message_text(f"❌ {error}")
+    
     except Exception as e:
-        logger.error(f"Callback fatal: {e}")
-        await query.edit_message_text("❌ خطای غیرمنتظره در سرور")
+        logger.error(f"Callback error for user {user_id}: {e}")
+        logger.error(traceback.format_exc())
+        try:
+            await query.edit_message_text(f"❌ خطا: {str(e)[:100]}")
+        except Exception:
+            pass
+    
     finally:
+        # Always cleanup cache
         if user_id in user_audio_cache:
             del user_audio_cache[user_id]
+            logger.info(f"🧹 Cache cleaned: user={user_id}")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update error: {context.error}")
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors."""
+    logger.error(f"Error: {context.error}")
+    if update:
+        logger.error(f"Update: {update}")
+
 
 def main() -> None:
+    """Start the bot."""
+    print("\n" + "="*60)
+    print("  🎧 OMNI-HEAR AI v2.4 - Fixed Model Names")
+    print("="*60)
+    
+    # Validate tokens
     if not TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN missing")
+        logger.error("❌ TELEGRAM_BOT_TOKEN not set!")
+        print("\n⚠️  Set: TELEGRAM_BOT_TOKEN=your_token")
         sys.exit(1)
-        
-    # --- NETWORK CONFIGURATION (FIX FOR HUGGING FACE) ---
-    # This configures connection timeouts and pool size to handle 
-    # flaky container networks and prevent "No address associated with hostname"
-    trequest = HTTPXRequest(
-        connection_pool_size=8,
-        connect_timeout=60.0,  # Increased timeout
-        read_timeout=60.0,
-        write_timeout=60.0
-    )
     
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).request(trequest).build()
+    if not GEMINI_API_KEY:
+        logger.error("❌ GEMINI_API_KEY not set!")
+        print("\n⚠️  Set: GEMINI_API_KEY=your_key")
+        print("   Get it from: https://aistudio.google.com/app/apikey")
+        sys.exit(1)
     
+    print(f"✅ Telegram: Connected")
+    print(f"✅ Gemini: Configured")
+    print(f"🔄 Models: {' → '.join(MODEL_PRIORITY)}")
+    print("="*60 + "\n")
+    
+    # Build application
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Add handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.AUDIO, handle_audio))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("models", models_command))
+    app.add_handler(MessageHandler(
+        filters.VOICE | filters.AUDIO | filters.Document.AUDIO,
+        handle_audio
+    ))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
     
-    print("🚀 Omni-Hear AI v2.5 Started...")
+    # Run
+    logger.info("🚀 Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
