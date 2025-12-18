@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                      OMNI-HEAR AI v4.0 (Multilingual)                        ║
-║              Advanced Audio Processing + Translation + Lyrics                 ║
+║                   OMNI-HEAR AI v6.0 (Dual-Engine Edition)                    ║
+║            ⚡ Fast Mode (Groq 70B) | 🚀 Pro Mode (SambaNova 405B)            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  🌍 Languages: Persian, English, French, Spanish, Russian, German, Arabic    ║
-║  🎵 Smart Lyrics: Genius API + AI Fallback                                   ║
-║  🔄 Translation: Any language to any language                                 ║
-║  ⚡ Powered by Groq (Whisper + Llama 3.3)                                    ║
+║  🎤 STT: Groq Whisper Large V3 (with context prompting)                      ║
+║  ⚡ Fast LLM: Groq Llama 3.3 70B (~3 seconds)                                ║
+║  🚀 Pro LLM: SambaNova Llama 3.1 405B (Maximum Accuracy)                     ║
+║  🌍 7 Languages | 🔄 Auto-Fallback | 📊 Dual-Button UI                       ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -17,12 +17,10 @@ import logging
 import asyncio
 import tempfile
 import traceback
-import re
-import urllib.parse
-from typing import Optional, Tuple, Dict
+from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
+from enum import Enum
 
-import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -34,6 +32,7 @@ from telegram.ext import (
 )
 
 from groq import Groq
+from openai import OpenAI
 from pydub import AudioSegment
 
 # ============== LOGGING ==============
@@ -46,32 +45,57 @@ logger = logging.getLogger(__name__)
 # ============== CONFIGURATION ==============
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GENIUS_API_KEY = os.getenv("GENIUS_API_KEY", "")  # Optional for lyrics
+SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY")
 
-# ============== GROQ CLIENT ==============
+# ============== API CLIENTS ==============
 groq_client: Optional[Groq] = None
+sambanova_client: Optional[OpenAI] = None
 
-if not GROQ_API_KEY:
-    logger.error("❌ GROQ_API_KEY is not set!")
-else:
-    logger.info(f"✅ GROQ_API_KEY configured")
+if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
+    logger.info("✅ Groq client initialized")
+else:
+    logger.error("❌ GROQ_API_KEY not set!")
+
+if SAMBANOVA_API_KEY:
+    sambanova_client = OpenAI(
+        api_key=SAMBANOVA_API_KEY,
+        base_url="https://api.sambanova.ai/v1"
+    )
+    logger.info("✅ SambaNova client initialized")
+else:
+    logger.warning("⚠️ SAMBANOVA_API_KEY not set - Pro mode unavailable")
 
 # ============== MODEL CONFIGURATION ==============
 WHISPER_MODEL = "whisper-large-v3"
-LLM_MODEL_PRIMARY = "llama-3.3-70b-versatile"
-LLM_MODEL_FALLBACK = "llama-3.1-70b-versatile"
-LLM_MODEL_FAST = "llama-3.1-8b-instant"
+GROQ_LLM_PRIMARY = "llama-3.3-70b-versatile"
+GROQ_LLM_FALLBACK = "llama-3.1-8b-instant"
+SAMBANOVA_MODEL_PRO = "Meta-Llama-3.1-405B-Instruct"
+SAMBANOVA_MODEL_FALLBACK = "Meta-Llama-3.1-70B-Instruct"
 
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
 
-# ============== SUPPORTED LANGUAGES ==============
+# Whisper context prompt for better accuracy
+WHISPER_CONTEXT_PROMPT = """Medical terminology: SOAP, diagnosis, patient, symptoms, treatment, prescription, 
+blood pressure, cardiac, respiratory, neurological, assessment, differential diagnosis.
+Academic terms: professor, lecture, university, chapter, introduction, conclusion, methodology.
+Persian academic: درس، استاد، دانشگاه، فصل، مقدمه، نتیجه‌گیری، تشخیص، بیمار، درمان."""
+
+
+# ============== ENGINE TYPES ==============
+class Engine(Enum):
+    FAST = "fast"   # Groq 70B
+    PRO = "pro"     # SambaNova 405B
+
+
+# ============== LANGUAGES ==============
 @dataclass
 class Language:
     code: str
     name_en: str
     name_native: str
     flag: str
+
 
 LANGUAGES: Dict[str, Language] = {
     "fa": Language("fa", "Persian", "فارسی", "🇮🇷"),
@@ -83,329 +107,627 @@ LANGUAGES: Dict[str, Language] = {
     "ar": Language("ar", "Arabic", "العربية", "🇸🇦"),
 }
 
-# ============== SYSTEM PROMPTS ==============
-def get_transcript_prompt(target_lang: Optional[str] = None) -> str:
-    """Get transcript prompt, optionally for a specific language."""
-    base = """You are an expert transcription formatter.
-
-**INPUT:** Raw transcription text from audio.
-
-**YOUR TASK:** Clean and format this transcription perfectly.
-
-**RULES:**
-1. Fix any obvious transcription errors
-2. Add proper punctuation
-3. Break into logical paragraphs
-4. If multiple speakers, mark as [Speaker 1], [Speaker 2]
-5. Keep mixed language words in their original script
-6. Mark unclear parts appropriately
-
-**OUTPUT:** Clean, formatted transcription."""
-    
-    if target_lang and target_lang in LANGUAGES:
-        lang = LANGUAGES[target_lang]
-        base += f"\n\n**OUTPUT LANGUAGE:** {lang.name_en} ({lang.name_native})"
-    
-    return base
+# ============== USER STATE ==============
+user_audio_cache: Dict[int, dict] = {}
+user_state: Dict[int, dict] = {}
 
 
-def get_translation_prompt(source_lang: str, target_lang: str) -> str:
-    """Generate translation prompt for any language pair."""
-    source = LANGUAGES.get(source_lang, LANGUAGES["en"])
-    target = LANGUAGES.get(target_lang, LANGUAGES["en"])
-    
-    return f"""You are an expert translator specializing in {source.name_en} to {target.name_en} translation.
+# ============== ADVANCED SYSTEM PROMPTS ==============
 
-**INPUT:** Text transcribed from audio in {source.name_en}.
+def get_soap_prompt_pro() -> str:
+    """Advanced Medical SOAP prompt for 405B Pro Engine."""
+    return """Role: Senior Board-Certified Attending Physician with 20+ years of clinical experience at a major academic medical center.
 
-**YOUR TASK:** Translate the text to {target.name_en} ({target.name_native}).
+Task: Transform the provided medical dictation into a comprehensive, US Medical Standard clinical SOAP Note that meets Joint Commission (JCAHO) documentation requirements.
 
-**TRANSLATION RULES:**
-1. Maintain the original meaning and tone
-2. Use natural, fluent {target.name_en}
-3. Preserve proper nouns and names
-4. Keep technical terms accurate
-5. Maintain paragraph structure
-6. For idioms, use equivalent expressions in {target.name_en}
+DOCUMENTATION STANDARDS:
+- Follow CMS Documentation Guidelines
+- Include all medically necessary information
+- Use standard medical abbreviations appropriately
+- Maintain HIPAA-compliant language
 
-**OUTPUT FORMAT:**
-First, provide a brief summary (1-2 sentences) of what the audio is about.
-Then provide the full translation.
+FORMAT:
 
-**OUTPUT LANGUAGE:** {target.name_en} ({target.name_native}) ONLY"""
+═══════════════════════════════════════════════════════════════
+                         SOAP NOTE
+═══════════════════════════════════════════════════════════════
+
+📋 SUBJECTIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+**Chief Complaint (CC):**
+[Primary reason for visit - patient's own words in quotes]
+
+**History of Present Illness (HPI):**
+Capture with chronological precision using OLDCARTS:
+- Onset: [When did it start?]
+- Location: [Where is the problem?]
+- Duration: [How long does it last?]
+- Character: [What does it feel like?]
+- Aggravating Factors: [What makes it worse?]
+- Relieving Factors: [What makes it better?]
+- Timing: [When does it occur?]
+- Severity: [Rate 1-10]
+- Associated Symptoms: [Related symptoms]
+
+**Review of Systems (ROS):**
+□ Constitutional: [Fever, weight changes, fatigue]
+□ HEENT: [Head, eyes, ears, nose, throat]
+□ Cardiovascular: [Chest pain, palpitations, edema]
+□ Respiratory: [Dyspnea, cough, wheezing]
+□ Gastrointestinal: [Nausea, vomiting, abdominal pain]
+□ Genitourinary: [Dysuria, frequency, hematuria]
+□ Musculoskeletal: [Joint pain, stiffness, swelling]
+□ Neurological: [Headache, dizziness, weakness]
+□ Psychiatric: [Mood, anxiety, sleep]
+□ Integumentary: [Rash, lesions, changes]
+
+**Past Medical History (PMH):**
+**Past Surgical History (PSH):**
+**Medications:** [Include dose, frequency, route]
+**Allergies:** [Drug allergies with reaction type - NKDA if none]
+**Family History (FHx):**
+**Social History (SHx):**
+- Tobacco: [Pack-years or never]
+- Alcohol: [Drinks per week]
+- Illicit drugs: [Yes/No, type if yes]
+- Occupation:
+- Living situation:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔬 OBJECTIVE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+**Vital Signs:**
+| Parameter | Value | Reference |
+|-----------|-------|-----------|
+| BP | /mmHg | <120/80 |
+| HR | bpm | 60-100 |
+| RR | /min | 12-20 |
+| Temp | °F (°C) | 97.8-99.1°F |
+| SpO2 | % | >95% |
+| Weight | kg/lbs | |
+| Height | cm/in | |
+| BMI | kg/m² | 18.5-24.9 |
+
+**Physical Examination:**
+
+*General:* [Appearance, distress level, cooperation]
+
+*HEENT:*
+- Head: [Normocephalic, atraumatic]
+- Eyes: [PERRLA, EOM intact, conjunctivae]
+- Ears: [TMs, canals]
+- Nose: [Patency, mucosa]
+- Throat: [Oropharynx, tonsils, uvula]
+
+*Neck:* [Supple, lymphadenopathy, thyroid, JVD]
+
+*Cardiovascular:* [Rate, rhythm, murmurs, S1/S2, peripheral pulses, edema]
+
+*Pulmonary:* [Effort, breath sounds, wheezes, rhonchi, rales]
+
+*Abdomen:* [Soft, tenderness, distension, bowel sounds, organomegaly]
+
+*Extremities:* [Edema, cyanosis, clubbing, ROM]
+
+*Neurological:* [Mental status, cranial nerves, motor, sensory, reflexes, gait]
+
+*Skin:* [Color, turgor, lesions, rashes]
+
+**Diagnostic Results:**
+
+*Laboratory:*
+| Test | Result | Reference Range | Flag |
+|------|--------|-----------------|------|
+| | | | |
+
+*Imaging:*
+[Modality, findings, impression]
+
+*Other Studies:*
+[EKG, PFTs, etc.]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 ASSESSMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+**Primary Diagnosis:**
+[Diagnosis] — ICD-10: [Code]
+
+**Differential Diagnoses (Prioritized):**
+1. [Most likely] — ICD-10: [Code]
+   - Supporting evidence:
+   - Against:
+2. [Second likely] — ICD-10: [Code]
+3. [Third likely] — ICD-10: [Code]
+
+**Clinical Reasoning:**
+[Brief explanation of diagnostic thought process]
+
+**Risk Stratification:**
+[Low/Moderate/High risk with justification]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📋 PLAN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+**Diagnostic Plan:**
+- [ ] [Tests to order with rationale]
+
+**Therapeutic Plan:**
+- [ ] [Medications: Drug, Dose, Route, Frequency, Duration]
+- [ ] [Procedures]
+- [ ] [Therapies]
+
+**Patient Education:**
+- [ ] [Key points discussed]
+- [ ] [Warning signs to watch for]
+- [ ] [Lifestyle modifications]
+
+**Disposition:**
+☐ Discharge home
+☐ Admit to: [Unit]
+☐ Transfer to: [Facility]
+☐ Observation
+
+**Follow-up:**
+- [Timeframe]: [Provider/Specialty]
+- Return precautions: [Specific symptoms]
+
+**Referrals:**
+- [ ] [Specialty]: [Reason]
+
+═══════════════════════════════════════════════════════════════
+
+CRITICAL INSTRUCTIONS:
+1. OUTPUT MUST BE IN ENGLISH ONLY
+2. Correct any medical mispronunciations from transcription
+3. Use standard medical terminology and abbreviations
+4. Include ICD-10 codes for all diagnoses
+5. If information not provided, mark as "Not documented" or "Not assessed"
+6. Flag any critical or concerning findings with ⚠️
+7. Maintain formal, objective clinical tone throughout"""
 
 
-def get_lecture_prompt(lang: str = "fa") -> str:
-    """Get lecture prompt for specific language."""
-    target = LANGUAGES.get(lang, LANGUAGES["fa"])
-    
+def get_soap_prompt_fast() -> str:
+    """Simplified SOAP prompt for Fast Engine."""
+    return """You are an experienced physician. Create a SOAP Note from this medical dictation.
+
+FORMAT:
+## SUBJECTIVE
+- CC, HPI, ROS, PMH, Medications, Allergies
+
+## OBJECTIVE  
+- Vitals, Physical Exam, Labs/Imaging
+
+## ASSESSMENT
+- Diagnosis with ICD-10 codes
+- Differential diagnoses
+
+## PLAN
+- Treatment, medications, follow-up
+
+OUTPUT: English only. Correct medical terminology errors."""
+
+
+def get_lecture_prompt_pro(lang: str = "fa") -> str:
+    """Advanced Academic Lecture prompt for 405B Pro Engine."""
     prompts = {
-        "fa": """You are a distinguished University Professor.
+        "fa": """نقش: استاد برجسته دانشگاه با سابقه ۲۰ ساله تدریس و تألیف کتب مرجع دانشگاهی.
 
-**INPUT:** Transcription of an educational audio/lecture.
+وظیفه: تبدیل رونویسی صوت به یک فصل جامع کتاب مرجع دانشگاهی (در سطح کتاب‌های مرجع مانند هاریسون، گایتون، یا رابینز).
 
-**YOUR TASK:** Transform this into a comprehensive **Textbook Chapter in Persian (Farsi)**.
+═══════════════════════════════════════════════════════════════
+                      فصل درسی آکادمیک
+═══════════════════════════════════════════════════════════════
 
-**REQUIREMENTS:**
-1. زبان خروجی: فارسی روان و آکادمیک
-2. Use **bold headers** for sections
-3. Cover EVERY detail from the audio
-4. Add helpful explanations
-5. Structure logically
-6. Keep technical terms in original form
+📚 ساختار الزامی:
 
-**OUTPUT LANGUAGE: PERSIAN (فارسی) ONLY**""",
-        
-        "en": """You are a distinguished University Professor.
+**۱. مقدمه علمی (Introduction)**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- تعریف دقیق موضوع با ارجاع به مفاهیم پایه
+- اهمیت بالینی/علمی موضوع
+- اهداف یادگیری این فصل
+- پیش‌نیازهای مطالعه
 
-**INPUT:** Transcription of an educational audio/lecture.
+**۲. متن اصلی (Main Content)**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- تقسیم‌بندی منطقی با **عناوین درشت**
+- توضیح گام‌به‌گام مفاهیم از ساده به پیچیده
+- استفاده از مثال‌های بالینی/کاربردی
+- ارتباط بین مفاهیم مختلف
 
-**YOUR TASK:** Transform this into a comprehensive **Textbook Chapter in English**.
+**۳. نکات کلیدی (Clinical Pearls) 💎**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- نکات مهم برای به‌خاطر سپردن
+- اشتباهات رایج و نحوه اجتناب
+- نکات امتحانی (High-Yield Points)
 
-**REQUIREMENTS:**
-1. Academic, clear English
-2. Use **bold headers** for sections
-3. Cover EVERY detail from the audio
-4. Add helpful explanations
-5. Structure logically
+**۴. جداول آموزشی (Educational Tables) 📊**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| عنوان | توضیح | مثال |
+|-------|-------|------|
+| | | |
 
-**OUTPUT LANGUAGE: ENGLISH ONLY**""",
+**۵. خلاصه فصل (Summary)**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- مرور نکات کلیدی
+- نقشه مفهومی (Concept Map)
 
-        "fr": """Vous êtes un professeur d'université distingué.
+**۶. سؤالات مروری (Review Questions)**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- ۳-۵ سؤال برای خودآزمایی
 
-**INPUT:** Transcription d'un audio/cours éducatif.
+═══════════════════════════════════════════════════════════════
 
-**VOTRE TÂCHE:** Transformez ceci en un **Chapitre de Manuel Complet en Français**.
+📝 الزامات نگارشی:
 
-**EXIGENCES:**
-1. Français académique et fluide
-2. Utilisez des **en-têtes en gras** pour les sections
-3. Couvrez TOUS les détails
-4. Structure logique
+۱. **زبان:** فارسی رسمی و آکادمیک - از کلمات عامیانه استفاده نشود
+۲. **اصطلاحات تخصصی:** به فارسی با معادل انگلیسی در پرانتز
+   مثال: فشار خون (Blood Pressure)
+۳. **ساختار جملات:** روان، علمی، بدون پیچیدگی غیرضروری
+۴. **پاراگراف‌بندی:** هر پاراگراف یک ایده اصلی
+۵. **تأکید:** استفاده از **بولد** برای نکات مهم
 
-**LANGUE DE SORTIE: FRANÇAIS UNIQUEMENT**""",
+🎯 هدف نهایی: خواننده پس از مطالعه این فصل، نیازی به گوش دادن به صوت اصلی نداشته باشد و درک کاملی از موضوع پیدا کند.
 
-        "es": """Usted es un distinguido Profesor Universitario.
+زبان خروجی: فقط فارسی آکادمیک""",
 
-**INPUT:** Transcripción de un audio/clase educativa.
+        "en": """Role: Distinguished University Professor with 20+ years of teaching and textbook authoring experience.
 
-**SU TAREA:** Transforme esto en un **Capítulo de Libro de Texto Completo en Español**.
+Task: Transform the audio transcription into a comprehensive Reference Textbook Chapter (similar to Harrison's, Guyton's, or Robbins' standards).
 
-**REQUISITOS:**
-1. Español académico y fluido
-2. Use **encabezados en negrita** para las secciones
-3. Cubra TODOS los detalles
-4. Estructura lógica
+STRUCTURE:
 
-**IDIOMA DE SALIDA: ESPAÑOL ÚNICAMENTE**""",
+## 1. Introduction
+- Scientific definition with foundational concepts
+- Clinical/scientific significance
+- Learning objectives
+- Prerequisites
 
-        "de": """Sie sind ein angesehener Universitätsprofessor.
+## 2. Main Content
+- Logical organization with **bold headers**
+- Step-by-step explanation from simple to complex
+- Clinical/practical examples
+- Concept interconnections
 
-**INPUT:** Transkription eines Bildungsaudios/Vorlesung.
+## 3. Clinical Pearls 💎
+- Key points to remember
+- Common mistakes to avoid
+- High-yield examination points
 
-**IHRE AUFGABE:** Verwandeln Sie dies in ein umfassendes **Lehrbuchkapitel auf Deutsch**.
+## 4. Educational Tables 📊
+| Topic | Description | Example |
+|-------|-------------|---------|
 
-**ANFORDERUNGEN:**
-1. Akademisches, flüssiges Deutsch
-2. Verwenden Sie **fette Überschriften** für Abschnitte
-3. Decken Sie ALLE Details ab
-4. Logische Struktur
+## 5. Chapter Summary
+- Key points review
+- Concept map
 
-**AUSGABESPRACHE: NUR DEUTSCH**""",
+## 6. Review Questions
+- 3-5 self-assessment questions
 
-        "ru": """Вы — выдающийся университетский профессор.
+OUTPUT LANGUAGE: English only, formal academic tone.""",
 
-**INPUT:** Транскрипция образовательного аудио/лекции.
+        "fr": """Rôle: Professeur d'université distingué.
+Tâche: Transformer la transcription en un chapitre de manuel académique complet en français.
+Structure: Introduction, Contenu principal avec en-têtes, Points clés, Tableaux, Résumé, Questions.
+LANGUE DE SORTIE: Français académique uniquement.""",
 
-**ВАША ЗАДАЧА:** Преобразуйте это в полноценную **Главу Учебника на Русском языке**.
+        "es": """Rol: Profesor universitario distinguido.
+Tarea: Transformar la transcripción en un capítulo de libro de texto académico completo en español.
+Estructura: Introducción, Contenido principal con encabezados, Puntos clave, Tablas, Resumen, Preguntas.
+IDIOMA DE SALIDA: Español académico únicamente.""",
 
-**ТРЕБОВАНИЯ:**
-1. Академический, грамотный русский
-2. Используйте **жирные заголовки** для разделов
-3. Охватите ВСЕ детали
-4. Логичная структура
+        "de": """Rolle: Angesehener Universitätsprofessor.
+Aufgabe: Die Transkription in ein umfassendes akademisches Lehrbuchkapitel auf Deutsch umwandeln.
+Struktur: Einleitung, Hauptinhalt mit Überschriften, Kernpunkte, Tabellen, Zusammenfassung, Fragen.
+AUSGABESPRACHE: Nur akademisches Deutsch.""",
 
-**ЯЗЫК ВЫВОДА: ТОЛЬКО РУССКИЙ**""",
+        "ru": """Роль: Выдающийся профессор университета.
+Задача: Преобразовать транскрипцию в полноценную главу академического учебника на русском языке.
+Структура: Введение, Основное содержание с заголовками, Ключевые моменты, Таблицы, Резюме, Вопросы.
+ЯЗЫК ВЫВОДА: Только академический русский.""",
 
-        "ar": """أنت أستاذ جامعي متميز.
-
-**INPUT:** نص مكتوب من صوت/محاضرة تعليمية.
-
-**مهمتك:** حوّل هذا إلى **فصل كتاب دراسي شامل باللغة العربية**.
-
-**المتطلبات:**
-1. لغة عربية أكاديمية وسلسة
-2. استخدم **عناوين غامقة** للأقسام
-3. غطِّ جميع التفاصيل
-4. هيكل منطقي
-
-**لغة الإخراج: العربية فقط**"""
+        "ar": """الدور: أستاذ جامعي متميز.
+المهمة: تحويل النص المكتوب إلى فصل كتاب أكاديمي شامل باللغة العربية.
+الهيكل: مقدمة، محتوى رئيسي مع عناوين، نقاط رئيسية، جداول، ملخص، أسئلة.
+لغة الإخراج: العربية الأكاديمية فقط."""
     }
-    
     return prompts.get(lang, prompts["en"])
 
 
-def get_soap_prompt() -> str:
-    """SOAP note prompt - always English."""
-    return """You are a Chief Resident physician at a major teaching hospital.
+def get_lecture_prompt_fast(lang: str = "fa") -> str:
+    """Simplified Lecture prompt for Fast Engine."""
+    target = LANGUAGES.get(lang, LANGUAGES["fa"])
+    return f"""You are a university professor. Create a comprehensive lecture notes document.
 
-**INPUT:** Transcription of a medical dictation or patient encounter.
+Include:
+1. Introduction
+2. Main content with bold headers
+3. Key points
+4. Summary
 
-**YOUR TASK:** Create a professional **SOAP Note in English**.
-
-**FORMAT (STRICT):**
-
-**SUBJECTIVE:**
-- Chief Complaint (CC):
-- History of Present Illness (HPI):
-- Review of Systems (ROS):
-- Past Medical History (PMH):
-- Medications:
-- Allergies:
-
-**OBJECTIVE:**
-- Vital Signs:
-- Physical Examination:
-- Laboratory Results:
-- Imaging:
-
-**ASSESSMENT:**
-- Primary Diagnosis:
-- Differential Diagnoses:
-- ICD-10 Codes:
-
-**PLAN:**
-- Treatment:
-- Medications:
-- Follow-up:
-- Referrals:
-
-**OUTPUT LANGUAGE: ENGLISH ONLY**"""
+OUTPUT LANGUAGE: {target.name_en} ({target.name_native}) only."""
 
 
-def get_summary_prompt(lang: str = "fa") -> str:
-    """Get summary prompt for specific language."""
+def get_summary_prompt(lang: str, engine: Engine) -> str:
+    """Summary prompt for specified language and engine."""
     target = LANGUAGES.get(lang, LANGUAGES["fa"])
     
-    return f"""You are an expert summarizer.
+    if engine == Engine.PRO:
+        return f"""Role: Expert Content Analyst and Academic Summarizer.
 
-**INPUT:** Transcription of audio content.
+Task: Create a comprehensive, structured summary in {target.name_en} ({target.name_native}).
 
-**YOUR TASK:** Create a clear, concise summary in **{target.name_en} ({target.name_native})**.
+FORMAT:
 
-**FORMAT:**
-• Use bullet points
-• Focus on key information
-• Remove unnecessary details
-• Clear and fluent language
+📌 **نمای کلی / Executive Summary**
+[3-4 sentences capturing the essence]
 
-**STRUCTURE:**
-📌 **Overview:** Brief summary (1-2 sentences)
+📋 **نکات کلیدی / Key Points**
+• [Point 1 - most important]
+• [Point 2]
+• [Point 3]
+• [Continue as needed...]
 
-📋 **Key Points:**
-• Point 1
-• Point 2
-• Point 3
+💡 **جزئیات مهم / Critical Details**
+[Names, numbers, dates, specific information]
 
-🎯 **Conclusion:** Final takeaway
+📊 **ساختار محتوا / Content Structure**
+[How the original content was organized]
 
-**OUTPUT LANGUAGE: {target.name_en.upper()} ({target.name_native}) ONLY**"""
+🎯 **نتیجه‌گیری / Conclusions**
+[Main takeaways and implications]
+
+✅ **اقدامات پیشنهادی / Recommended Actions** (if applicable)
+[Any action items mentioned]
+
+OUTPUT LANGUAGE: {target.name_en.upper()} ({target.name_native}) ONLY"""
+    else:
+        return f"""Summarize this content in {target.name_en}.
+
+Include:
+• Overview (2-3 sentences)
+• Key points (bullet list)
+• Conclusion
+
+OUTPUT: {target.name_en} only."""
 
 
-def get_lyrics_prompt() -> str:
+def get_transcript_prompt(lang: str, engine: Engine) -> str:
+    """Transcript formatting prompt."""
+    target = LANGUAGES.get(lang, LANGUAGES["fa"])
+    
+    if engine == Engine.PRO:
+        return f"""Role: Professional Transcription Specialist.
+
+Task: Format and clean the raw transcription with expert precision.
+
+RULES:
+1. Fix transcription errors while preserving original meaning
+2. Add proper punctuation (. , ? ! : ; —)
+3. Create logical paragraph breaks
+4. Mark speakers as [Speaker 1], [Speaker 2] if multiple
+5. Preserve mixed-language content:
+   - Keep English words in Latin script within {target.name_en} text
+   - Example: "من یک meeting داشتم" stays as-is
+6. Mark unclear audio as [نامفهوم] or [unclear]
+7. Add timestamps for long content: [00:00]
+8. Preserve technical terms, names, and numbers exactly
+
+FORMAT:
+Clean, professional paragraphs with proper formatting.
+
+OUTPUT LANGUAGE: Preserve original language, format in {target.name_en}."""
+    else:
+        return f"""Clean and format this transcription.
+- Fix errors, add punctuation
+- Create paragraphs
+- Mark unclear parts as [unclear]
+- Keep original language
+OUTPUT: Formatted text."""
+
+
+def get_lyrics_prompt(engine: Engine) -> str:
     """Lyrics extraction prompt."""
-    return """You are a music transcription specialist with expertise in lyrics.
+    if engine == Engine.PRO:
+        return """Role: Professional Music Transcriptionist and Lyrics Analyst.
 
-**INPUT:** Transcription of audio (likely music).
+Task: Extract and format lyrics OR speech transcription with expert precision.
 
-**YOUR TASK:** Format this as proper song lyrics.
+FOR MUSIC:
+🎵 **Song Information** (if identifiable)
+- Title:
+- Artist:
+- Album:
+- Genre:
+- Language:
 
-**FORMAT:**
+---
+
+[Intro] (if applicable)
+
 [Verse 1]
 Line 1
 Line 2
+...
+
+[Pre-Chorus]
+...
 
 [Chorus]
-Line 1
-Line 2
+...
 
 [Verse 2]
 ...
 
-[Bridge] (if applicable)
+[Bridge]
 ...
 
-[Outro] (if applicable)
+[Outro]
 ...
 
-**RULES:**
-1. Keep the original language
-2. Proper line breaks
-3. Identify song structure (verse, chorus, bridge, etc.)
-4. Mark instrumental sections as [Instrumental]
-5. If you can identify the song/artist, mention it at the top
+---
 
-**OUTPUT:** Formatted lyrics in original language"""
+📝 **Notes:**
+- Describe the mood/tone
+- Note any background vocals
+- Identify instruments if notable
+
+FOR SPEECH:
+Format as clean paragraphs with speaker identification.
+
+RULES:
+1. Keep ORIGINAL language - never translate
+2. Mark instrumental: [🎸 Guitar Solo], [🎹 Piano], [🥁 Drums]
+3. Mark unclear lyrics: [...]
+4. Note harmonies: (harmony) or [Background: ...]
+5. Include ad-libs in parentheses
+
+OUTPUT: Original language, professionally formatted."""
+    else:
+        return """Extract lyrics or transcribe speech.
+
+Format:
+[Verse 1]
+Lines...
+
+[Chorus]
+Lines...
+
+Keep original language. Mark unclear parts as [...].
+OUTPUT: Formatted lyrics/transcription."""
 
 
-# ============== PERSIAN MESSAGES ==============
+def get_translation_prompt(source_lang: str, target_lang: str, engine: Engine) -> str:
+    """Translation prompt between languages."""
+    source = LANGUAGES.get(source_lang, LANGUAGES["en"])
+    target = LANGUAGES.get(target_lang, LANGUAGES["fa"])
+    
+    if engine == Engine.PRO:
+        return f"""Role: Expert Translator with native fluency in both {source.name_en} and {target.name_en}.
+
+Task: Translate the content from {source.name_en} to {target.name_en} with professional quality.
+
+TRANSLATION PRINCIPLES:
+
+1. **Semantic Accuracy:** Preserve complete meaning
+2. **Natural Fluency:** Use idiomatic {target.name_en}
+3. **Tone Preservation:** Maintain speaker's style
+4. **Cultural Adaptation:** Adapt cultural references appropriately
+5. **Technical Precision:** Keep specialized terms accurate
+
+SPECIAL HANDLING:
+- **Proper nouns:** Keep original or use standard transliteration
+- **Idioms:** Use equivalent expressions, not literal translation
+- **Numbers/Dates:** Convert to target locale if appropriate
+- **Quotes:** Preserve with appropriate quotation marks
+- **Technical terms:** Translate with original in parentheses
+
+OUTPUT FORMAT:
+
+📝 **{target.name_native} Translation:**
+
+[Full translated text]
+
+---
+
+📌 **خلاصه / Summary:**
+[2-3 sentence summary of content]
+
+🔤 **کلمات کلیدی / Keywords:**
+[Key terms from the text]
+
+OUTPUT LANGUAGE: {target.name_en.upper()} ({target.name_native}) ONLY"""
+    else:
+        return f"""Translate from {source.name_en} to {target.name_en}.
+
+Maintain:
+- Original meaning
+- Natural expression
+- Proper nouns
+
+OUTPUT: {target.name_en} translation only."""
+
+
+# ============== UI MESSAGES ==============
 MESSAGES = {
     "welcome": """🎧 **به Omni-Hear AI خوش آمدید!**
-    
-🚀 **نسخه 4.0 - چندزبانه**
 
-🎤 یک فایل صوتی یا ویس ارسال کنید.
+🚀 **نسخه 6.0 - موتور دوگانه**
 
-⚡ **قابلیت‌ها:**
-• 📜 رونویسی کامل
-• 📚 درسنامه (۷ زبان)
-• 🩺 شرح‌حال پزشکی SOAP
-• 📝 خلاصه متن
-• 🎵 متن آهنگ (با جستجوی هوشمند)
-• 🌍 ترجمه به ۷ زبان
+**⚡ حالت سریع:** پاسخ در ۳ ثانیه (Llama 70B)
+**🚀 حالت دقیق:** حداکثر کیفیت (Llama 405B)
+
+📤 **یک فایل صوتی یا ویس ارسال کنید**
 
 🌐 **زبان‌ها:**
 🇮🇷 فارسی | 🇬🇧 English | 🇫🇷 Français
 🇪🇸 Español | 🇩🇪 Deutsch | 🇷🇺 Русский | 🇸🇦 العربية""",
 
-    "audio_received": "🎵 **فایل دریافت شد!**\n\n📋 نوع پردازش را انتخاب کنید:",
+    "audio_received": """🎵 **فایل دریافت شد!** ({size})
+
+⚡ **سریع** = پاسخ سریع (~۳ ثانیه)
+🚀 **دقیق** = کیفیت حرفه‌ای (405B)
+
+📋 نوع پردازش را انتخاب کنید:""",
+
     "select_language": "🌍 **زبان خروجی را انتخاب کنید:**",
-    "select_source_lang": "🗣 **زبان صوت (مبدا) را انتخاب کنید:**",
-    "select_target_lang": "🎯 **زبان مقصد ترجمه را انتخاب کنید:**",
+    "select_source_lang": "🗣 **زبان صوت (مبدا):**",
+    "select_target_lang": "🎯 **زبان ترجمه (مقصد):**",
+    
     "processing_stt": "🎤 **مرحله ۱/۲:** تبدیل صدا به متن...",
-    "processing_llm": "🧠 **مرحله ۲/۲:** پردازش هوشمند...",
-    "processing_lyrics": "🎵 **جستجوی متن آهنگ...**",
-    "lyrics_found": "✅ **متن آهنگ از دیتابیس پیدا شد!**",
-    "lyrics_ai": "🤖 **متن با هوش مصنوعی استخراج شد**",
+    "processing_fast": "⚡ **مرحله ۲/۲:** پردازش سریع با Llama 70B...",
+    "processing_pro": "🚀 **مرحله ۲/۲:** پردازش حرفه‌ای با Llama 405B...",
+    "fallback_notice": "⚠️ سرویس 405B در دسترس نیست. استفاده از حالت سریع...",
+    
     "error": "❌ خطا در پردازش. لطفاً دوباره تلاش کنید.",
     "no_audio": "⚠️ لطفاً ابتدا یک فایل صوتی ارسال کنید.",
     "file_too_large": "⚠️ حجم فایل بیشتر از ۲۵ مگابایت است.",
-    "not_audio": "⚠️ لطفاً یک فایل صوتی ارسال کنید.",
-    "api_key_missing": "⚠️ GROQ_API_KEY تنظیم نشده!",
+    "not_audio": "⚠️ لطفاً فایل صوتی ارسال کنید (MP3, OGG, WAV, M4A).",
+    "api_missing": "⚠️ کلید API تنظیم نشده: {missing}",
+    "pro_unavailable": "⚠️ حالت Pro در دسترس نیست. از حالت سریع استفاده شد.",
 }
-
-# ============== USER CACHE ==============
-user_audio_cache: dict = {}
-user_state: dict = {}  # Track user's current operation state
 
 
 # ============== KEYBOARDS ==============
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Main processing menu."""
+    """Main menu with dual buttons for each feature."""
     return InlineKeyboardMarkup([
+        # Transcript
         [
-            InlineKeyboardButton("📜 رونویسی کامل", callback_data="mode:transcript"),
+            InlineKeyboardButton("📜 رونویسی ⚡", callback_data="mode:transcript:fast"),
+            InlineKeyboardButton("📜 رونویسی 🚀", callback_data="mode:transcript:pro"),
         ],
+        # Lecture
         [
-            InlineKeyboardButton("📚 درسنامه", callback_data="mode:lecture"),
-            InlineKeyboardButton("🩺 SOAP پزشکی", callback_data="mode:soap"),
+            InlineKeyboardButton("📚 درسنامه ⚡", callback_data="mode:lecture:fast"),
+            InlineKeyboardButton("📚 درسنامه 🚀", callback_data="mode:lecture:pro"),
         ],
+        # Medical SOAP
         [
-            InlineKeyboardButton("📝 خلاصه", callback_data="mode:summary"),
-            InlineKeyboardButton("🎵 متن آهنگ", callback_data="mode:lyrics"),
+            InlineKeyboardButton("🩺 پزشکی ⚡", callback_data="mode:soap:fast"),
+            InlineKeyboardButton("🩺 پزشکی 🚀", callback_data="mode:soap:pro"),
         ],
+        # Summary
         [
-            InlineKeyboardButton("🌍 ترجمه صوت", callback_data="mode:translate"),
+            InlineKeyboardButton("📝 خلاصه ⚡", callback_data="mode:summary:fast"),
+            InlineKeyboardButton("📝 خلاصه 🚀", callback_data="mode:summary:pro"),
+        ],
+        # Lyrics
+        [
+            InlineKeyboardButton("🎵 متن آهنگ ⚡", callback_data="mode:lyrics:fast"),
+            InlineKeyboardButton("🎵 متن آهنگ 🚀", callback_data="mode:lyrics:pro"),
+        ],
+        # Translation
+        [
+            InlineKeyboardButton("🌍 ترجمه ⚡", callback_data="mode:translate:fast"),
+            InlineKeyboardButton("🌍 ترجمه 🚀", callback_data="mode:translate:pro"),
         ],
     ])
 
@@ -428,14 +750,12 @@ def get_language_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
     if row:
         buttons.append(row)
     
-    # Add back button
     buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back:main")])
-    
     return InlineKeyboardMarkup(buttons)
 
 
-def get_target_language_keyboard(source_lang: str) -> InlineKeyboardMarkup:
-    """Target language keyboard (excludes source language)."""
+def get_target_language_keyboard(source_lang: str, callback_prefix: str) -> InlineKeyboardMarkup:
+    """Target language keyboard excluding source."""
     buttons = []
     row = []
     
@@ -444,7 +764,7 @@ def get_target_language_keyboard(source_lang: str) -> InlineKeyboardMarkup:
             continue
         btn = InlineKeyboardButton(
             f"{lang.flag} {lang.name_native}",
-            callback_data=f"target_lang:{code}"
+            callback_data=f"{callback_prefix}:{code}"
         )
         row.append(btn)
         if len(row) == 3:
@@ -455,163 +775,32 @@ def get_target_language_keyboard(source_lang: str) -> InlineKeyboardMarkup:
         buttons.append(row)
     
     buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back:main")])
-    
     return InlineKeyboardMarkup(buttons)
 
 
-# ============== GENIUS LYRICS API ==============
-async def search_genius_lyrics(query: str) -> Optional[Dict]:
-    """Search for lyrics on Genius."""
-    if not GENIUS_API_KEY:
-        logger.info("Genius API key not configured, skipping lyrics search")
-        return None
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Search for song
-            search_url = "https://api.genius.com/search"
-            headers = {"Authorization": f"Bearer {GENIUS_API_KEY}"}
-            params = {"q": query}
-            
-            response = await client.get(search_url, headers=headers, params=params)
-            
-            if response.status_code != 200:
-                logger.warning(f"Genius search failed: {response.status_code}")
-                return None
-            
-            data = response.json()
-            hits = data.get("response", {}).get("hits", [])
-            
-            if not hits:
-                return None
-            
-            # Get first result
-            song = hits[0]["result"]
-            
-            return {
-                "title": song.get("title", ""),
-                "artist": song.get("primary_artist", {}).get("name", ""),
-                "url": song.get("url", ""),
-                "thumbnail": song.get("song_art_image_thumbnail_url", ""),
-            }
-            
-    except Exception as e:
-        logger.error(f"Genius search error: {e}")
-        return None
-
-
-async def get_lyrics_from_url(url: str) -> Optional[str]:
-    """Scrape lyrics from Genius URL."""
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url)
-            
-            if response.status_code != 200:
-                return None
-            
-            html = response.text
-            
-            # Extract lyrics using regex (Genius stores lyrics in specific divs)
-            # This is a simplified extraction
-            lyrics_pattern = r'<div[^>]*class="[^"]*Lyrics__Container[^"]*"[^>]*>(.*?)</div>'
-            matches = re.findall(lyrics_pattern, html, re.DOTALL)
-            
-            if matches:
-                lyrics = ""
-                for match in matches:
-                    # Clean HTML tags
-                    clean = re.sub(r'<br\s*/?>', '\n', match)
-                    clean = re.sub(r'<[^>]+>', '', clean)
-                    clean = clean.strip()
-                    lyrics += clean + "\n\n"
-                
-                return lyrics.strip() if lyrics.strip() else None
-            
-            return None
-            
-    except Exception as e:
-        logger.error(f"Lyrics scraping error: {e}")
-        return None
-
-
-async def identify_song_from_transcription(transcription: str) -> Optional[Dict]:
-    """Use LLM to identify song from transcription."""
-    if not groq_client:
-        return None
-    
-    try:
-        prompt = """Analyze this transcription which may be from a song.
-
-**YOUR TASK:**
-1. Determine if this is likely song lyrics or spoken content
-2. If it's a song, try to identify:
-   - Song title
-   - Artist name
-   - Any recognizable lyrics phrases
-
-**OUTPUT FORMAT (JSON):**
-{
-    "is_song": true/false,
-    "confidence": "high/medium/low",
-    "title": "song title or null",
-    "artist": "artist name or null", 
-    "search_query": "best search query for this song"
-}
-
-**TRANSCRIPTION:**
-""" + transcription[:1500]
-
-        response = await asyncio.to_thread(
-            lambda: groq_client.chat.completions.create(
-                model=LLM_MODEL_FAST,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-                temperature=0.3,
-            )
-        )
-        
-        if response.choices:
-            result_text = response.choices[0].message.content
-            
-            # Try to parse JSON from response
-            json_match = re.search(r'\{[^}]+\}', result_text, re.DOTALL)
-            if json_match:
-                import json
-                try:
-                    return json.loads(json_match.group())
-                except json.JSONDecodeError:
-                    pass
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Song identification error: {e}")
-        return None
-
-
-# ============== AUDIO CONVERSION ==============
+# ============== AUDIO PROCESSING ==============
 async def convert_audio_to_mp3(audio_data: bytes, original_format: str = "ogg") -> Tuple[Optional[bytes], Optional[str]]:
-    """Convert audio to MP3 format."""
+    """Convert audio to MP3."""
     try:
         def _convert():
-            with tempfile.NamedTemporaryFile(suffix=f".{original_format}", delete=False) as input_file:
-                input_file.write(audio_data)
-                input_path = input_file.name
+            with tempfile.NamedTemporaryFile(suffix=f".{original_format}", delete=False) as f:
+                f.write(audio_data)
+                input_path = f.name
             
             try:
-                if original_format in ["ogg", "oga"]:
+                if original_format in ["ogg", "oga", "opus"]:
                     audio = AudioSegment.from_ogg(input_path)
                 elif original_format == "mp3":
-                    audio = AudioSegment.from_mp3(input_path)
+                    return audio_data, None
                 elif original_format == "wav":
                     audio = AudioSegment.from_wav(input_path)
-                elif original_format == "m4a":
+                elif original_format in ["m4a", "mp4"]:
                     audio = AudioSegment.from_file(input_path, format="m4a")
                 else:
                     audio = AudioSegment.from_file(input_path)
                 
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as output_file:
-                    output_path = output_file.name
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as out:
+                    output_path = out.name
                 
                 audio.export(output_path, format="mp3", bitrate="128k")
                 
@@ -620,40 +809,39 @@ async def convert_audio_to_mp3(audio_data: bytes, original_format: str = "ogg") 
                 
                 os.unlink(output_path)
                 return mp3_data, None
-                
             finally:
                 if os.path.exists(input_path):
                     os.unlink(input_path)
         
         return await asyncio.to_thread(_convert)
-        
     except Exception as e:
         logger.error(f"Audio conversion error: {e}")
         return None, str(e)
 
 
-# ============== GROQ STT ==============
-async def transcribe_audio(audio_data: bytes) -> Tuple[Optional[str], Optional[str]]:
-    """Transcribe audio using Groq Whisper."""
+# ============== GROQ WHISPER STT ==============
+async def transcribe_with_whisper(audio_data: bytes) -> Tuple[Optional[str], Optional[str]]:
+    """Transcribe with Groq Whisper including context prompt."""
     if not groq_client:
         return None, "Groq client not initialized"
     
     try:
         def _transcribe():
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
-                temp_file.write(audio_data)
-                temp_path = temp_file.name
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                f.write(audio_data)
+                temp_path = f.name
             
             try:
                 with open(temp_path, "rb") as audio_file:
-                    transcription = groq_client.audio.transcriptions.create(
+                    result = groq_client.audio.transcriptions.create(
                         model=WHISPER_MODEL,
                         file=audio_file,
                         response_format="text",
                         language=None,  # Auto-detect
                         temperature=0.0,
+                        prompt=WHISPER_CONTEXT_PROMPT,  # Context for better accuracy
                     )
-                return transcription, None
+                return result, None
             finally:
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
@@ -664,88 +852,150 @@ async def transcribe_audio(audio_data: bytes) -> Tuple[Optional[str], Optional[s
             return None, error
         
         if result and len(result.strip()) > 0:
-            logger.info(f"✅ Transcription: {len(result)} chars")
+            logger.info(f"✅ Whisper: {len(result)} chars")
             return result.strip(), None
-        else:
-            return None, "Empty transcription"
-            
+        
+        return None, "Empty transcription"
+    
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Transcription error: {error_msg}")
+        logger.error(f"Whisper error: {error_msg}")
+        if "rate_limit" in error_msg.lower():
+            return None, "rate_limit"
         return None, error_msg[:100]
 
 
-# ============== GROQ LLM ==============
-async def process_with_llm(
-    text: str,
-    system_prompt: str
-) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Process text with Groq LLM."""
+# ============== GROQ LLM (FAST) ==============
+async def process_with_groq(text: str, system_prompt: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Process with Groq LLM (Fast mode)."""
     if not groq_client:
         return None, None, "Groq client not initialized"
     
-    models = [LLM_MODEL_PRIMARY, LLM_MODEL_FALLBACK, LLM_MODEL_FAST]
+    models = [GROQ_LLM_PRIMARY, GROQ_LLM_FALLBACK]
     
-    for model_name in models:
+    for model in models:
         try:
-            logger.info(f"🔄 Trying LLM: {model_name}")
+            logger.info(f"⚡ Groq: {model}")
             
-            response = await asyncio.to_thread(
-                lambda m=model_name: groq_client.chat.completions.create(
-                    model=m,
+            def _generate():
+                return groq_client.chat.completions.create(
+                    model=model,
                     messages=[
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": text}
+                        {"role": "user", "content": f"Process:\n\n{text}"}
                     ],
                     temperature=0.7,
                     max_tokens=8000,
                 )
-            )
+            
+            response = await asyncio.to_thread(_generate)
             
             if response.choices and response.choices[0].message.content:
                 result = response.choices[0].message.content.strip()
-                logger.info(f"✅ LLM success: {model_name}")
-                return result, model_name, None
-                
+                logger.info(f"✅ Groq success: {len(result)} chars")
+                return result, f"⚡ {model}", None
+        
         except Exception as e:
-            logger.warning(f"❌ {model_name}: {str(e)[:50]}")
+            logger.warning(f"❌ Groq {model}: {str(e)[:50]}")
             continue
     
-    return None, None, "All models failed"
+    return None, None, "All Groq models failed"
 
 
-# ============== FULL PROCESSING ==============
-async def process_audio_full(
+# ============== SAMBANOVA LLM (PRO) ==============
+async def process_with_sambanova(text: str, system_prompt: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Process with SambaNova LLM (Pro mode)."""
+    if not sambanova_client:
+        return None, None, "SambaNova not available"
+    
+    models = [SAMBANOVA_MODEL_PRO, SAMBANOVA_MODEL_FALLBACK]
+    
+    for model in models:
+        try:
+            logger.info(f"🚀 SambaNova: {model}")
+            
+            def _generate():
+                return sambanova_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Process this transcription:\n\n{text}"}
+                    ],
+                    temperature=0.7,
+                    max_tokens=8000,
+                )
+            
+            response = await asyncio.to_thread(_generate)
+            
+            if response.choices and response.choices[0].message.content:
+                result = response.choices[0].message.content.strip()
+                logger.info(f"✅ SambaNova success: {len(result)} chars")
+                return result, f"🚀 {model}", None
+        
+        except Exception as e:
+            logger.warning(f"❌ SambaNova {model}: {str(e)[:50]}")
+            continue
+    
+    return None, None, "SambaNova failed"
+
+
+# ============== UNIFIED PROCESSOR ==============
+async def process_with_llm(
+    text: str,
+    system_prompt: str,
+    engine: Engine
+) -> Tuple[Optional[str], Optional[str], Optional[str], bool]:
+    """
+    Process with appropriate engine.
+    Returns: (result, model_name, error, used_fallback)
+    """
+    used_fallback = False
+    
+    if engine == Engine.PRO:
+        # Try SambaNova first
+        if sambanova_client:
+            result, model, error = await process_with_sambanova(text, system_prompt)
+            if result:
+                return result, model, None, False
+            logger.warning("SambaNova failed, falling back to Groq")
+        
+        # Fallback to Groq
+        used_fallback = True
+    
+    # Use Groq (Fast mode or fallback)
+    result, model, error = await process_with_groq(text, system_prompt)
+    return result, model, error, used_fallback
+
+
+# ============== FULL PIPELINE ==============
+async def process_audio_complete(
     audio_data: bytes,
     mime_type: str,
     mode: str,
+    engine: Engine,
     lang: str = "fa",
     source_lang: Optional[str] = None,
     target_lang: Optional[str] = None,
 ) -> Dict:
-    """
-    Full audio processing pipeline.
-    Returns dict with: result, transcription, model, lyrics_source, error
-    """
+    """Complete audio processing pipeline."""
     result = {
         "text": None,
         "transcription": None,
         "model": None,
-        "lyrics_source": None,
-        "song_info": None,
         "error": None,
+        "used_fallback": False,
     }
     
-    # Determine format and convert
+    # Format detection
     format_map = {
-        "audio/ogg": "ogg", "audio/oga": "ogg", "audio/opus": "ogg",
+        "audio/ogg": "ogg", "audio/oga": "ogg", "audio/opus": "opus",
         "audio/mp3": "mp3", "audio/mpeg": "mp3",
         "audio/wav": "wav", "audio/x-wav": "wav",
         "audio/m4a": "m4a", "audio/mp4": "m4a",
     }
-    
     original_format = format_map.get(mime_type, "ogg")
     
+    # Convert to MP3
     if original_format != "mp3":
         mp3_data, _ = await convert_audio_to_mp3(audio_data, original_format)
         if not mp3_data:
@@ -753,98 +1003,50 @@ async def process_audio_full(
     else:
         mp3_data = audio_data
     
-    # Step 1: Transcribe
-    transcription, stt_error = await transcribe_audio(mp3_data)
+    # Step 1: Transcribe with Whisper
+    transcription, stt_error = await transcribe_with_whisper(mp3_data)
     
     if stt_error:
-        result["error"] = f"❌ خطا در تبدیل صدا: {stt_error}"
+        if stt_error == "rate_limit":
+            result["error"] = "⚠️ محدودیت Whisper. چند دقیقه صبر کنید."
+        else:
+            result["error"] = f"❌ خطا در STT: {stt_error}"
         return result
     
     if not transcription:
-        result["error"] = "❌ متنی استخراج نشد"
+        result["error"] = "❌ متنی استخراج نشد."
         return result
     
     result["transcription"] = transcription
     
-    # Step 2: Process based on mode
+    # Step 2: Get appropriate prompt and process
     if mode == "transcript":
-        prompt = get_transcript_prompt(lang)
-        text, model, err = await process_with_llm(transcription, prompt)
-        result["text"] = text or transcription
-        result["model"] = model or WHISPER_MODEL
-        
+        prompt = get_transcript_prompt(lang, engine)
     elif mode == "lecture":
-        prompt = get_lecture_prompt(lang)
-        text, model, err = await process_with_llm(transcription, prompt)
-        result["text"] = text
-        result["model"] = model
-        if err:
-            result["error"] = err
-            
+        prompt = get_lecture_prompt_pro(lang) if engine == Engine.PRO else get_lecture_prompt_fast(lang)
     elif mode == "soap":
-        prompt = get_soap_prompt()
-        text, model, err = await process_with_llm(transcription, prompt)
-        result["text"] = text
-        result["model"] = model
-        if err:
-            result["error"] = err
-            
+        prompt = get_soap_prompt_pro() if engine == Engine.PRO else get_soap_prompt_fast()
     elif mode == "summary":
-        prompt = get_summary_prompt(lang)
-        text, model, err = await process_with_llm(transcription, prompt)
-        result["text"] = text
-        result["model"] = model
-        if err:
-            result["error"] = err
-            
+        prompt = get_summary_prompt(lang, engine)
     elif mode == "lyrics":
-        # Smart lyrics: Try to identify song and search Genius first
-        song_info = await identify_song_from_transcription(transcription)
-        
-        genius_lyrics = None
-        if song_info and song_info.get("is_song"):
-            result["song_info"] = song_info
-            
-            # Search Genius
-            search_query = song_info.get("search_query") or f"{song_info.get('title', '')} {song_info.get('artist', '')}"
-            genius_result = await search_genius_lyrics(search_query)
-            
-            if genius_result:
-                result["song_info"]["genius"] = genius_result
-                genius_lyrics = await get_lyrics_from_url(genius_result["url"])
-                
-                if genius_lyrics:
-                    result["text"] = f"""🎵 **{genius_result['title']}**
-🎤 **{genius_result['artist']}**
-🔗 [Genius]({genius_result['url']})
-
----
-
-{genius_lyrics}"""
-                    result["lyrics_source"] = "genius"
-                    result["model"] = "Genius API"
-                    return result
-        
-        # Fallback to AI lyrics extraction
-        prompt = get_lyrics_prompt()
-        text, model, err = await process_with_llm(transcription, prompt)
-        result["text"] = text
-        result["model"] = model
-        result["lyrics_source"] = "ai"
-        if err:
-            result["error"] = err
-            
+        prompt = get_lyrics_prompt(engine)
     elif mode == "translate":
         if not source_lang or not target_lang:
-            result["error"] = "زبان مبدا و مقصد مشخص نشده"
+            result["error"] = "❌ زبان مشخص نشده"
             return result
-        
-        prompt = get_translation_prompt(source_lang, target_lang)
-        text, model, err = await process_with_llm(transcription, prompt)
-        result["text"] = text
-        result["model"] = model
-        if err:
-            result["error"] = err
+        prompt = get_translation_prompt(source_lang, target_lang, engine)
+    else:
+        prompt = get_transcript_prompt(lang, engine)
+    
+    # Process with LLM
+    text, model, llm_error, used_fallback = await process_with_llm(transcription, prompt, engine)
+    
+    result["text"] = text
+    result["model"] = model
+    result["used_fallback"] = used_fallback
+    
+    if llm_error and not text:
+        result["error"] = f"❌ {llm_error}"
     
     return result
 
@@ -855,70 +1057,71 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    help_text = """📖 **راهنمای Omni-Hear AI v4.0**
+    help_text = """📖 **راهنمای Omni-Hear AI v6.0**
 
-**🔹 استفاده:**
+**🔹 نحوه استفاده:**
 1️⃣ فایل صوتی ارسال کنید
-2️⃣ نوع پردازش را انتخاب کنید
-3️⃣ زبان خروجی را انتخاب کنید (در صورت نیاز)
+2️⃣ حالت پردازش را انتخاب کنید:
+   • ⚡ سریع = پاسخ فوری
+   • 🚀 دقیق = کیفیت حرفه‌ای
 
-**🔹 حالت‌ها:**
+**🔹 قابلیت‌ها:**
 • 📜 رونویسی - متن کامل صوت
-• 📚 درسنامه - تبدیل به متن آموزشی
-• 🩺 SOAP - شرح‌حال پزشکی
-• 📝 خلاصه - خلاصه نکات مهم
-• 🎵 متن آهنگ - استخراج لیریک با جستجو در Genius
-• 🌍 ترجمه - ترجمه به ۷ زبان
+• 📚 درسنامه - فصل کتاب درسی
+• 🩺 پزشکی - SOAP Note استاندارد
+• 📝 خلاصه - خلاصه هوشمند
+• 🎵 متن آهنگ - لیریک
+• 🌍 ترجمه - ۷ زبان
 
-**🔹 زبان‌ها:**
-🇮🇷 فارسی | 🇬🇧 English | 🇫🇷 Français
-🇪🇸 Español | 🇩🇪 Deutsch | 🇷🇺 Русский | 🇸🇦 العربية
+**🔹 موتورها:**
+• ⚡ Groq Llama 70B (~۳ ثانیه)
+• 🚀 SambaNova Llama 405B (حرفه‌ای)
 
 **🔹 دستورات:**
 /start - شروع
 /help - راهنما
-/status - وضعیت سرویس"""
+/status - وضعیت"""
     
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status = ["🔍 **وضعیت سیستم**\n"]
-    status.append("✅ **Telegram:** متصل")
     
-    if GROQ_API_KEY and groq_client:
-        status.append("✅ **Groq API:** فعال")
+    if groq_client:
+        status.append("✅ **Groq (STT + Fast):** فعال")
     else:
-        status.append("❌ **Groq API:** غیرفعال")
+        status.append("❌ **Groq:** غیرفعال")
     
-    if GENIUS_API_KEY:
-        status.append("✅ **Genius API:** فعال (جستجوی لیریک)")
+    if sambanova_client:
+        status.append("✅ **SambaNova (Pro 405B):** فعال")
     else:
-        status.append("⚠️ **Genius API:** غیرفعال (اختیاری)")
+        status.append("⚠️ **SambaNova:** غیرفعال")
     
     status.append(f"\n**🤖 مدل‌ها:**")
     status.append(f"• STT: `{WHISPER_MODEL}`")
-    status.append(f"• LLM: `{LLM_MODEL_PRIMARY}`")
+    status.append(f"• Fast: `{GROQ_LLM_PRIMARY}`")
+    status.append(f"• Pro: `{SAMBANOVA_MODEL_PRO}`")
     
-    status.append(f"\n**🌍 زبان‌ها:** {len(LANGUAGES)} زبان پشتیبانی")
+    flags = " ".join([l.flag for l in LANGUAGES.values()])
+    status.append(f"\n**🌍 زبان‌ها:** {flags}")
     
     await update.message.reply_text("\n".join(status), parse_mode="Markdown")
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle audio files."""
     user_id = update.effective_user.id
     msg = update.message
     
-    if not GROQ_API_KEY or not groq_client:
-        await msg.reply_text(MESSAGES["api_key_missing"])
+    if not groq_client:
+        await msg.reply_text(MESSAGES["api_missing"].format(missing="GROQ_API_KEY"))
         return
     
+    # Get audio
     audio_file = None
-    file_type = "audio"
-    
     if msg.voice:
         audio_file = msg.voice
-        file_type = "voice"
     elif msg.audio:
         audio_file = msg.audio
     elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("audio/"):
@@ -927,6 +1130,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text(MESSAGES["not_audio"])
         return
     
+    # Size check
     file_size = getattr(audio_file, 'file_size', 0)
     if file_size and file_size > MAX_FILE_SIZE:
         await msg.reply_text(MESSAGES["file_too_large"])
@@ -936,51 +1140,48 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file = await context.bot.get_file(audio_file.file_id)
         audio_bytes = await file.download_as_bytearray()
         
-        if file_type == "voice":
-            mime_type = "audio/ogg"
-        elif hasattr(audio_file, 'mime_type') and audio_file.mime_type:
-            mime_type = audio_file.mime_type
-        else:
-            mime_type = "audio/mpeg"
+        mime_type = "audio/ogg" if msg.voice else getattr(audio_file, 'mime_type', 'audio/mpeg')
         
         user_audio_cache[user_id] = {
             "data": bytes(audio_bytes),
             "mime_type": mime_type,
+            "size": len(audio_bytes),
         }
         
-        # Clear any previous state
+        # Clear state
         user_state.pop(user_id, None)
         
-        logger.info(f"✅ Audio cached: user={user_id}, size={len(audio_bytes)}")
+        size_kb = len(audio_bytes) / 1024
+        size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
         
         await msg.reply_text(
-            MESSAGES["audio_received"],
+            MESSAGES["audio_received"].format(size=size_str),
             reply_markup=get_main_menu_keyboard(),
             parse_mode="Markdown"
         )
-        
+    
     except Exception as e:
-        logger.error(f"Audio download error: {e}")
+        logger.error(f"Audio error: {e}")
         await msg.reply_text(MESSAGES["error"])
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle button callbacks."""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
     data = query.data
-    
-    # Parse callback data
     parts = data.split(":")
     action = parts[0]
-    value = parts[1] if len(parts) > 1 else None
     
-    # Handle back button
+    # Back button
     if action == "back":
         if user_id in user_audio_cache:
+            size_kb = user_audio_cache[user_id]["size"] / 1024
+            size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
             await query.edit_message_text(
-                MESSAGES["audio_received"],
+                MESSAGES["audio_received"].format(size=size_str),
                 reply_markup=get_main_menu_keyboard(),
                 parse_mode="Markdown"
             )
@@ -989,68 +1190,73 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_state.pop(user_id, None)
         return
     
-    # Handle mode selection
+    # Mode selection: mode:type:engine
     if action == "mode":
-        mode = value
+        mode = parts[1]
+        engine_str = parts[2]
+        engine = Engine.PRO if engine_str == "pro" else Engine.FAST
         
         if user_id not in user_audio_cache:
             await query.edit_message_text(MESSAGES["no_audio"])
             return
         
-        # Modes that need language selection
+        # Store engine preference
+        user_state[user_id] = {"engine": engine}
+        
+        # Modes needing language selection
         if mode in ["transcript", "lecture", "summary"]:
-            user_state[user_id] = {"mode": mode, "step": "select_lang"}
+            user_state[user_id]["mode"] = mode
             await query.edit_message_text(
                 MESSAGES["select_language"],
-                reply_markup=get_language_keyboard(f"lang_{mode}"),
+                reply_markup=get_language_keyboard(f"lang:{mode}:{engine_str}"),
                 parse_mode="Markdown"
             )
             return
         
-        # Translation needs source and target language
+        # Translation needs source + target
         if mode == "translate":
-            user_state[user_id] = {"mode": mode, "step": "select_source"}
+            user_state[user_id]["mode"] = mode
             await query.edit_message_text(
                 MESSAGES["select_source_lang"],
-                reply_markup=get_language_keyboard("source_lang"),
+                reply_markup=get_language_keyboard(f"source:{engine_str}"),
                 parse_mode="Markdown"
             )
             return
         
         # SOAP and Lyrics - process directly
-        await process_and_respond(query, context, user_id, mode)
+        await process_and_respond(query, context, user_id, mode, engine)
         return
     
-    # Handle language selection for transcript/lecture/summary
-    if action.startswith("lang_"):
-        mode = action.replace("lang_", "")
-        lang = value
-        await process_and_respond(query, context, user_id, mode, lang=lang)
+    # Language selection: lang:mode:engine:code
+    if action == "lang":
+        mode = parts[1]
+        engine_str = parts[2]
+        lang = parts[3]
+        engine = Engine.PRO if engine_str == "pro" else Engine.FAST
+        await process_and_respond(query, context, user_id, mode, engine, lang=lang)
         return
     
-    # Handle source language for translation
-    if action == "source_lang":
-        source = value
-        user_state[user_id] = {
-            "mode": "translate",
-            "step": "select_target",
-            "source_lang": source
-        }
+    # Source language: source:engine:code
+    if action == "source":
+        engine_str = parts[1]
+        source_lang = parts[2]
+        user_state[user_id]["source_lang"] = source_lang
         await query.edit_message_text(
             MESSAGES["select_target_lang"],
-            reply_markup=get_target_language_keyboard(source),
+            reply_markup=get_target_language_keyboard(source_lang, f"target:{engine_str}"),
             parse_mode="Markdown"
         )
         return
     
-    # Handle target language for translation
-    if action == "target_lang":
-        target = value
-        state = user_state.get(user_id, {})
-        source = state.get("source_lang", "en")
+    # Target language: target:engine:code
+    if action == "target":
+        engine_str = parts[1]
+        target_lang = parts[2]
+        engine = Engine.PRO if engine_str == "pro" else Engine.FAST
+        source_lang = user_state.get(user_id, {}).get("source_lang", "en")
         await process_and_respond(
-            query, context, user_id, "translate",
-            source_lang=source, target_lang=target
+            query, context, user_id, "translate", engine,
+            source_lang=source_lang, target_lang=target_lang
         )
         return
 
@@ -1060,11 +1266,12 @@ async def process_and_respond(
     context,
     user_id: int,
     mode: str,
+    engine: Engine,
     lang: str = "fa",
     source_lang: Optional[str] = None,
     target_lang: Optional[str] = None,
 ) -> None:
-    """Process audio and send response."""
+    """Process and send response."""
     
     if user_id not in user_audio_cache:
         await query.edit_message_text(MESSAGES["no_audio"])
@@ -1072,31 +1279,30 @@ async def process_and_respond(
     
     audio_info = user_audio_cache[user_id]
     
-    # Mode display names
     mode_names = {
         "transcript": "📜 رونویسی",
         "lecture": "📚 درسنامه",
-        "soap": "🩺 SOAP",
+        "soap": "🩺 SOAP پزشکی",
         "summary": "📝 خلاصه",
         "lyrics": "🎵 متن آهنگ",
         "translate": "🌍 ترجمه",
     }
     
+    engine_name = "🚀 Pro (405B)" if engine == Engine.PRO else "⚡ Fast (70B)"
+    
     try:
-        # Show processing message
-        processing_msg = f"🎯 **{mode_names.get(mode, mode)}**\n\n{MESSAGES['processing_stt']}"
-        if mode == "translate" and source_lang and target_lang:
-            src = LANGUAGES.get(source_lang, LANGUAGES["en"])
-            tgt = LANGUAGES.get(target_lang, LANGUAGES["fa"])
-            processing_msg += f"\n\n{src.flag} {src.name_native} → {tgt.flag} {tgt.name_native}"
+        # Show STT progress
+        await query.edit_message_text(
+            f"🎯 **{mode_names.get(mode)}** | {engine_name}\n\n{MESSAGES['processing_stt']}",
+            parse_mode="Markdown"
+        )
         
-        await query.edit_message_text(processing_msg, parse_mode="Markdown")
-        
-        # Process audio
-        result = await process_audio_full(
+        # Process
+        result = await process_audio_complete(
             audio_info["data"],
             audio_info["mime_type"],
             mode,
+            engine,
             lang=lang,
             source_lang=source_lang,
             target_lang=target_lang,
@@ -1111,26 +1317,23 @@ async def process_and_respond(
             return
         
         # Build response
-        header = f"✅ **{mode_names.get(mode, mode)}**\n\n"
+        header = f"✅ **{mode_names.get(mode)}**\n"
         
-        # Add lyrics source info
-        if mode == "lyrics":
-            if result["lyrics_source"] == "genius":
-                header = f"✅ **{MESSAGES['lyrics_found']}**\n\n"
-            else:
-                header = f"✅ **{MESSAGES['lyrics_ai']}**\n\n"
-        
-        # Add translation info
         if mode == "translate" and source_lang and target_lang:
             src = LANGUAGES.get(source_lang)
             tgt = LANGUAGES.get(target_lang)
-            header += f"{src.flag} → {tgt.flag}\n\n"
+            header += f"{src.flag} → {tgt.flag}\n"
         
+        header += "\n"
+        
+        # Footer with model info
         footer = f"\n\n---\n🤖 `{result['model']}`"
+        if result["used_fallback"]:
+            footer += f"\n⚠️ {MESSAGES['pro_unavailable']}"
         
         full_text = header + result["text"] + footer
         
-        # Send response (handle long messages)
+        # Send (handle long messages)
         if len(full_text) > 4000:
             await query.edit_message_text(full_text[:4000], parse_mode="Markdown")
             remaining = full_text[4000:]
@@ -1146,7 +1349,7 @@ async def process_and_respond(
         else:
             try:
                 await query.edit_message_text(full_text, parse_mode="Markdown")
-            except Exception:
+            except:
                 await query.edit_message_text(full_text)
     
     except Exception as e:
@@ -1155,7 +1358,6 @@ async def process_and_respond(
         await query.edit_message_text(f"❌ خطا: {str(e)[:100]}")
     
     finally:
-        # Cleanup
         user_audio_cache.pop(user_id, None)
         user_state.pop(user_id, None)
 
@@ -1166,10 +1368,10 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ============== MAIN ==============
 def main() -> None:
-    print("\n" + "="*65)
-    print("  🎧 OMNI-HEAR AI v4.0 - MULTILINGUAL EDITION")
-    print("  🌍 7 Languages | 🎵 Smart Lyrics | 🔄 Translation")
-    print("="*65)
+    print("\n" + "=" * 70)
+    print("  🎧 OMNI-HEAR AI v6.0 - DUAL-ENGINE EDITION")
+    print("  ⚡ Fast (Groq 70B) | 🚀 Pro (SambaNova 405B)")
+    print("=" * 70)
     
     if not TELEGRAM_BOT_TOKEN:
         print("❌ TELEGRAM_BOT_TOKEN not set!")
@@ -1180,10 +1382,10 @@ def main() -> None:
         sys.exit(1)
     
     print(f"✅ Telegram: Ready")
-    print(f"✅ Groq: Configured")
-    print(f"{'✅' if GENIUS_API_KEY else '⚠️'} Genius: {'Configured' if GENIUS_API_KEY else 'Not configured (optional)'}")
-    print(f"🌍 Languages: {', '.join([l.flag for l in LANGUAGES.values()])}")
-    print("="*65 + "\n")
+    print(f"✅ Groq (STT + Fast): Ready")
+    print(f"{'✅' if SAMBANOVA_API_KEY else '⚠️'} SambaNova (Pro): {'Ready' if SAMBANOVA_API_KEY else 'Not configured'}")
+    print(f"\n🌍 Languages: {', '.join([l.flag for l in LANGUAGES.values()])}")
+    print("=" * 70 + "\n")
     
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
@@ -1197,7 +1399,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
     
-    logger.info("🚀 Bot starting...")
+    logger.info("🚀 Starting bot...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
