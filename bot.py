@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                           OMNI-HEAR AI v2.5                                  ║
-║              Added Full Transcript + Auto Language Detection                 ║
+║                      OMNI-HEAR AI v4.0 (Multilingual)                        ║
+║              Advanced Audio Processing + Translation + Lyrics                 ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  ✅ NEW: Full Transcript mode with auto language detection                   ║
-║  ✅ SMART: Preserves English words in Persian text                           ║
-║  ✅ UPDATED: Model priority list                                             ║
+║  🌍 Languages: Persian, English, French, Spanish, Russian, German, Arabic    ║
+║  🎵 Smart Lyrics: Genius API + AI Fallback                                   ║
+║  🔄 Translation: Any language to any language                                 ║
+║  ⚡ Powered by Groq (Whisper + Llama 3.3)                                    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 import os
 import sys
 import logging
-import base64
 import asyncio
+import tempfile
 import traceback
-from typing import Optional, Tuple
+import re
+import urllib.parse
+from typing import Optional, Tuple, Dict
+from dataclasses import dataclass
 
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -28,8 +33,8 @@ from telegram.ext import (
     filters,
 )
 
-import google.generativeai as genai
-from google.api_core import exceptions as google_exceptions
+from groq import Groq
+from pydub import AudioSegment
 
 # ============== LOGGING ==============
 logging.basicConfig(
@@ -40,222 +45,871 @@ logger = logging.getLogger(__name__)
 
 # ============== CONFIGURATION ==============
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GENIUS_API_KEY = os.getenv("GENIUS_API_KEY", "")  # Optional for lyrics
 
-# ============== VALIDATE API KEY ==============
-if not GEMINI_API_KEY:
-    logger.error("❌ GEMINI_API_KEY is not set!")
-    print("⚠️  Please set GEMINI_API_KEY environment variable")
+# ============== GROQ CLIENT ==============
+groq_client: Optional[Groq] = None
+
+if not GROQ_API_KEY:
+    logger.error("❌ GROQ_API_KEY is not set!")
 else:
-    logger.info(f"✅ GEMINI_API_KEY configured (length: {len(GEMINI_API_KEY)})")
-    genai.configure(api_key=GEMINI_API_KEY)
+    logger.info(f"✅ GROQ_API_KEY configured")
+    groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ============== MODEL PRIORITY (UPDATED) ==============
-MODEL_PRIORITY: list[str] = [
-    "gemini-2.5-flash-lite",      # 🥇 بیشترین سهمیه رایگان (1,000 تا 1,500 درخواست در روز)
-    "gemini-2.0-flash",           # 🥈 مدل استاندارد (1,000 درخواست در روز)
-    "gemini-2.5-flash",           # 🥉 سهمیه محدود شده (فقط ۲۰ درخواست در روز)
-    "gemini-1.5-flash-latest",    # 🛡️ زاپاس نهایی (مدل قدیمی)
-]
+# ============== MODEL CONFIGURATION ==============
+WHISPER_MODEL = "whisper-large-v3"
+LLM_MODEL_PRIMARY = "llama-3.3-70b-versatile"
+LLM_MODEL_FALLBACK = "llama-3.1-70b-versatile"
+LLM_MODEL_FAST = "llama-3.1-8b-instant"
 
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
+MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
 
-# ============== SYSTEM PROMPTS ==============
-PROMPTS = {
-    "lecture": """You are a University Professor teaching in Persian (Farsi).
-Listen to this audio carefully. Do NOT summarize.
-Write a comprehensive **Textbook Chapter in Persian**.
-Cover every single detail, example, and nuance mentioned.
-Use bold headers (با ** علامت‌گذاری کنید) to organize sections.
-The goal is to replace the need to listen to the audio entirely.
-Write in fluent, academic Persian. زبان خروجی حتماً فارسی باشد.""",
+# ============== SUPPORTED LANGUAGES ==============
+@dataclass
+class Language:
+    code: str
+    name_en: str
+    name_native: str
+    flag: str
 
-    "soap": """You are a Chief Resident at a teaching hospital.
-Listen to this medical dictation audio.
-Write a professional **SOAP Note in English**.
-Format:
-**Subjective:** (Chief complaint, HPI, ROS, PMH, medications, allergies)
-**Objective:** (Vitals, physical exam findings, lab results, imaging)
-**Assessment:** (Diagnoses with ICD codes if possible)
-**Plan:** (Treatment plan, medications, follow-up)
-Correct all medical terminology. Output MUST be in English only.""",
-
-    "summary": """Listen to this audio carefully.
-Summarize the content into clear, concise **Persian bullet points**.
-Use • for bullet points. Write in fluent Persian.
-Focus on the most important information.
-زبان خروجی حتماً فارسی باشد.""",
-
-    "lyrics": """Listen to this audio.
-If it contains music: Extract and provide the complete lyrics in the original language.
-If it contains speech: Provide a verbatim transcription in the original language.
-Format the output cleanly with proper line breaks.""",
-
-    "transcript": """You are an expert transcriptionist. Listen to this audio very carefully.
-
-**YOUR TASK:** Create a COMPLETE and ACCURATE word-for-word transcription.
-
-**CRITICAL LANGUAGE RULES:**
-1. **AUTO-DETECT LANGUAGE:** Determine if the audio is primarily Persian (Farsi) or English.
-2. **PERSIAN AUDIO:** Write the transcription in Persian script (فارسی).
-3. **ENGLISH AUDIO:** Write the transcription in English.
-4. **MIXED LANGUAGE (VERY IMPORTANT):** If the speaker uses English words/phrases within Persian speech:
-   - Keep the English words in English letters
-   - Example: "من دیروز یک meeting داشتم و باید report رو submit کنم"
-   - Do NOT transliterate English words to Persian script
-5. **Technical terms, brand names, and proper nouns** should remain in their original form.
-
-**FORMAT:**
-- Write in clear paragraphs
-- Use proper punctuation
-- Indicate speaker changes with [Speaker 1], [Speaker 2] if multiple speakers
-- Mark unclear parts with [نامفهوم] or [unclear]
-- Include timestamps only if specifically requested
-
-**OUTPUT:** Complete verbatim transcription preserving the exact language as spoken."""
+LANGUAGES: Dict[str, Language] = {
+    "fa": Language("fa", "Persian", "فارسی", "🇮🇷"),
+    "en": Language("en", "English", "English", "🇬🇧"),
+    "fr": Language("fr", "French", "Français", "🇫🇷"),
+    "es": Language("es", "Spanish", "Español", "🇪🇸"),
+    "ru": Language("ru", "Russian", "Русский", "🇷🇺"),
+    "de": Language("de", "German", "Deutsch", "🇩🇪"),
+    "ar": Language("ar", "Arabic", "العربية", "🇸🇦"),
 }
 
-# Persian messages
+# ============== SYSTEM PROMPTS ==============
+def get_transcript_prompt(target_lang: Optional[str] = None) -> str:
+    """Get transcript prompt, optionally for a specific language."""
+    base = """You are an expert transcription formatter.
+
+**INPUT:** Raw transcription text from audio.
+
+**YOUR TASK:** Clean and format this transcription perfectly.
+
+**RULES:**
+1. Fix any obvious transcription errors
+2. Add proper punctuation
+3. Break into logical paragraphs
+4. If multiple speakers, mark as [Speaker 1], [Speaker 2]
+5. Keep mixed language words in their original script
+6. Mark unclear parts appropriately
+
+**OUTPUT:** Clean, formatted transcription."""
+    
+    if target_lang and target_lang in LANGUAGES:
+        lang = LANGUAGES[target_lang]
+        base += f"\n\n**OUTPUT LANGUAGE:** {lang.name_en} ({lang.name_native})"
+    
+    return base
+
+
+def get_translation_prompt(source_lang: str, target_lang: str) -> str:
+    """Generate translation prompt for any language pair."""
+    source = LANGUAGES.get(source_lang, LANGUAGES["en"])
+    target = LANGUAGES.get(target_lang, LANGUAGES["en"])
+    
+    return f"""You are an expert translator specializing in {source.name_en} to {target.name_en} translation.
+
+**INPUT:** Text transcribed from audio in {source.name_en}.
+
+**YOUR TASK:** Translate the text to {target.name_en} ({target.name_native}).
+
+**TRANSLATION RULES:**
+1. Maintain the original meaning and tone
+2. Use natural, fluent {target.name_en}
+3. Preserve proper nouns and names
+4. Keep technical terms accurate
+5. Maintain paragraph structure
+6. For idioms, use equivalent expressions in {target.name_en}
+
+**OUTPUT FORMAT:**
+First, provide a brief summary (1-2 sentences) of what the audio is about.
+Then provide the full translation.
+
+**OUTPUT LANGUAGE:** {target.name_en} ({target.name_native}) ONLY"""
+
+
+def get_lecture_prompt(lang: str = "fa") -> str:
+    """Get lecture prompt for specific language."""
+    target = LANGUAGES.get(lang, LANGUAGES["fa"])
+    
+    prompts = {
+        "fa": """You are a distinguished University Professor.
+
+**INPUT:** Transcription of an educational audio/lecture.
+
+**YOUR TASK:** Transform this into a comprehensive **Textbook Chapter in Persian (Farsi)**.
+
+**REQUIREMENTS:**
+1. زبان خروجی: فارسی روان و آکادمیک
+2. Use **bold headers** for sections
+3. Cover EVERY detail from the audio
+4. Add helpful explanations
+5. Structure logically
+6. Keep technical terms in original form
+
+**OUTPUT LANGUAGE: PERSIAN (فارسی) ONLY**""",
+        
+        "en": """You are a distinguished University Professor.
+
+**INPUT:** Transcription of an educational audio/lecture.
+
+**YOUR TASK:** Transform this into a comprehensive **Textbook Chapter in English**.
+
+**REQUIREMENTS:**
+1. Academic, clear English
+2. Use **bold headers** for sections
+3. Cover EVERY detail from the audio
+4. Add helpful explanations
+5. Structure logically
+
+**OUTPUT LANGUAGE: ENGLISH ONLY**""",
+
+        "fr": """Vous êtes un professeur d'université distingué.
+
+**INPUT:** Transcription d'un audio/cours éducatif.
+
+**VOTRE TÂCHE:** Transformez ceci en un **Chapitre de Manuel Complet en Français**.
+
+**EXIGENCES:**
+1. Français académique et fluide
+2. Utilisez des **en-têtes en gras** pour les sections
+3. Couvrez TOUS les détails
+4. Structure logique
+
+**LANGUE DE SORTIE: FRANÇAIS UNIQUEMENT**""",
+
+        "es": """Usted es un distinguido Profesor Universitario.
+
+**INPUT:** Transcripción de un audio/clase educativa.
+
+**SU TAREA:** Transforme esto en un **Capítulo de Libro de Texto Completo en Español**.
+
+**REQUISITOS:**
+1. Español académico y fluido
+2. Use **encabezados en negrita** para las secciones
+3. Cubra TODOS los detalles
+4. Estructura lógica
+
+**IDIOMA DE SALIDA: ESPAÑOL ÚNICAMENTE**""",
+
+        "de": """Sie sind ein angesehener Universitätsprofessor.
+
+**INPUT:** Transkription eines Bildungsaudios/Vorlesung.
+
+**IHRE AUFGABE:** Verwandeln Sie dies in ein umfassendes **Lehrbuchkapitel auf Deutsch**.
+
+**ANFORDERUNGEN:**
+1. Akademisches, flüssiges Deutsch
+2. Verwenden Sie **fette Überschriften** für Abschnitte
+3. Decken Sie ALLE Details ab
+4. Logische Struktur
+
+**AUSGABESPRACHE: NUR DEUTSCH**""",
+
+        "ru": """Вы — выдающийся университетский профессор.
+
+**INPUT:** Транскрипция образовательного аудио/лекции.
+
+**ВАША ЗАДАЧА:** Преобразуйте это в полноценную **Главу Учебника на Русском языке**.
+
+**ТРЕБОВАНИЯ:**
+1. Академический, грамотный русский
+2. Используйте **жирные заголовки** для разделов
+3. Охватите ВСЕ детали
+4. Логичная структура
+
+**ЯЗЫК ВЫВОДА: ТОЛЬКО РУССКИЙ**""",
+
+        "ar": """أنت أستاذ جامعي متميز.
+
+**INPUT:** نص مكتوب من صوت/محاضرة تعليمية.
+
+**مهمتك:** حوّل هذا إلى **فصل كتاب دراسي شامل باللغة العربية**.
+
+**المتطلبات:**
+1. لغة عربية أكاديمية وسلسة
+2. استخدم **عناوين غامقة** للأقسام
+3. غطِّ جميع التفاصيل
+4. هيكل منطقي
+
+**لغة الإخراج: العربية فقط**"""
+    }
+    
+    return prompts.get(lang, prompts["en"])
+
+
+def get_soap_prompt() -> str:
+    """SOAP note prompt - always English."""
+    return """You are a Chief Resident physician at a major teaching hospital.
+
+**INPUT:** Transcription of a medical dictation or patient encounter.
+
+**YOUR TASK:** Create a professional **SOAP Note in English**.
+
+**FORMAT (STRICT):**
+
+**SUBJECTIVE:**
+- Chief Complaint (CC):
+- History of Present Illness (HPI):
+- Review of Systems (ROS):
+- Past Medical History (PMH):
+- Medications:
+- Allergies:
+
+**OBJECTIVE:**
+- Vital Signs:
+- Physical Examination:
+- Laboratory Results:
+- Imaging:
+
+**ASSESSMENT:**
+- Primary Diagnosis:
+- Differential Diagnoses:
+- ICD-10 Codes:
+
+**PLAN:**
+- Treatment:
+- Medications:
+- Follow-up:
+- Referrals:
+
+**OUTPUT LANGUAGE: ENGLISH ONLY**"""
+
+
+def get_summary_prompt(lang: str = "fa") -> str:
+    """Get summary prompt for specific language."""
+    target = LANGUAGES.get(lang, LANGUAGES["fa"])
+    
+    return f"""You are an expert summarizer.
+
+**INPUT:** Transcription of audio content.
+
+**YOUR TASK:** Create a clear, concise summary in **{target.name_en} ({target.name_native})**.
+
+**FORMAT:**
+• Use bullet points
+• Focus on key information
+• Remove unnecessary details
+• Clear and fluent language
+
+**STRUCTURE:**
+📌 **Overview:** Brief summary (1-2 sentences)
+
+📋 **Key Points:**
+• Point 1
+• Point 2
+• Point 3
+
+🎯 **Conclusion:** Final takeaway
+
+**OUTPUT LANGUAGE: {target.name_en.upper()} ({target.name_native}) ONLY**"""
+
+
+def get_lyrics_prompt() -> str:
+    """Lyrics extraction prompt."""
+    return """You are a music transcription specialist with expertise in lyrics.
+
+**INPUT:** Transcription of audio (likely music).
+
+**YOUR TASK:** Format this as proper song lyrics.
+
+**FORMAT:**
+[Verse 1]
+Line 1
+Line 2
+
+[Chorus]
+Line 1
+Line 2
+
+[Verse 2]
+...
+
+[Bridge] (if applicable)
+...
+
+[Outro] (if applicable)
+...
+
+**RULES:**
+1. Keep the original language
+2. Proper line breaks
+3. Identify song structure (verse, chorus, bridge, etc.)
+4. Mark instrumental sections as [Instrumental]
+5. If you can identify the song/artist, mention it at the top
+
+**OUTPUT:** Formatted lyrics in original language"""
+
+
+# ============== PERSIAN MESSAGES ==============
 MESSAGES = {
     "welcome": """🎧 **به Omni-Hear AI خوش آمدید!**
+    
+🚀 **نسخه 4.0 - چندزبانه**
 
 🎤 یک فایل صوتی یا ویس ارسال کنید.
 
-⚡ قابلیت‌ها:
-• 📜 رونویسی کامل (Transcript)
-• 📚 درسنامه کامل (فارسی)
-• 🩺 شرح‌حال پزشکی SOAP (انگلیسی)
-• 📝 خلاصه متن (فارسی)
-• 🎵 متن آهنگ
+⚡ **قابلیت‌ها:**
+• 📜 رونویسی کامل
+• 📚 درسنامه (۷ زبان)
+• 🩺 شرح‌حال پزشکی SOAP
+• 📝 خلاصه متن
+• 🎵 متن آهنگ (با جستجوی هوشمند)
+• 🌍 ترجمه به ۷ زبان
 
-🔄 نسخه 2.5 - با تشخیص خودکار زبان""",
+🌐 **زبان‌ها:**
+🇮🇷 فارسی | 🇬🇧 English | 🇫🇷 Français
+🇪🇸 Español | 🇩🇪 Deutsch | 🇷🇺 Русский | 🇸🇦 العربية""",
 
-    "audio_received": "🎵 فایل دریافت شد!\n\n📋 نوع پردازش را انتخاب کنید:",
-    "processing": "⏳ در حال پردازش با هوش مصنوعی...\n\n⏱ لطفاً صبر کنید (۱۰-۳۰ ثانیه)",
+    "audio_received": "🎵 **فایل دریافت شد!**\n\n📋 نوع پردازش را انتخاب کنید:",
+    "select_language": "🌍 **زبان خروجی را انتخاب کنید:**",
+    "select_source_lang": "🗣 **زبان صوت (مبدا) را انتخاب کنید:**",
+    "select_target_lang": "🎯 **زبان مقصد ترجمه را انتخاب کنید:**",
+    "processing_stt": "🎤 **مرحله ۱/۲:** تبدیل صدا به متن...",
+    "processing_llm": "🧠 **مرحله ۲/۲:** پردازش هوشمند...",
+    "processing_lyrics": "🎵 **جستجوی متن آهنگ...**",
+    "lyrics_found": "✅ **متن آهنگ از دیتابیس پیدا شد!**",
+    "lyrics_ai": "🤖 **متن با هوش مصنوعی استخراج شد**",
     "error": "❌ خطا در پردازش. لطفاً دوباره تلاش کنید.",
-    "quota_exceeded": "⚠️ سقف استفاده API تمام شده.\n\n💡 لطفاً چند دقیقه صبر کنید یا با ادمین تماس بگیرید.",
-    "all_failed": "❌ خطا: {details}\n\n🔄 لطفاً دوباره تلاش کنید.",
     "no_audio": "⚠️ لطفاً ابتدا یک فایل صوتی ارسال کنید.",
-    "file_too_large": "⚠️ حجم فایل بیشتر از ۲۰ مگابایت است.",
+    "file_too_large": "⚠️ حجم فایل بیشتر از ۲۵ مگابایت است.",
     "not_audio": "⚠️ لطفاً یک فایل صوتی ارسال کنید.",
-    "api_key_missing": "⚠️ تنظیمات سرور ناقص است. GEMINI_API_KEY تنظیم نشده!",
+    "api_key_missing": "⚠️ GROQ_API_KEY تنظیم نشده!",
 }
 
-# Store user audio files temporarily
+# ============== USER CACHE ==============
 user_audio_cache: dict = {}
+user_state: dict = {}  # Track user's current operation state
 
 
-def get_menu_keyboard() -> InlineKeyboardMarkup:
-    """Create the Persian inline keyboard menu with 5 options."""
+# ============== KEYBOARDS ==============
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Main processing menu."""
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📜 رونویسی کامل", callback_data="transcript"),
+            InlineKeyboardButton("📜 رونویسی کامل", callback_data="mode:transcript"),
         ],
         [
-            InlineKeyboardButton("📚 درسنامه کامل", callback_data="lecture"),
-            InlineKeyboardButton("🩺 شرح‌حال پزشکی", callback_data="soap"),
+            InlineKeyboardButton("📚 درسنامه", callback_data="mode:lecture"),
+            InlineKeyboardButton("🩺 SOAP پزشکی", callback_data="mode:soap"),
         ],
         [
-            InlineKeyboardButton("📝 خلاصه متن", callback_data="summary"),
-            InlineKeyboardButton("🎵 متن آهنگ", callback_data="lyrics"),
+            InlineKeyboardButton("📝 خلاصه", callback_data="mode:summary"),
+            InlineKeyboardButton("🎵 متن آهنگ", callback_data="mode:lyrics"),
+        ],
+        [
+            InlineKeyboardButton("🌍 ترجمه صوت", callback_data="mode:translate"),
         ],
     ])
 
 
+def get_language_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
+    """Language selection keyboard."""
+    buttons = []
+    row = []
+    
+    for code, lang in LANGUAGES.items():
+        btn = InlineKeyboardButton(
+            f"{lang.flag} {lang.name_native}",
+            callback_data=f"{callback_prefix}:{code}"
+        )
+        row.append(btn)
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    
+    if row:
+        buttons.append(row)
+    
+    # Add back button
+    buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back:main")])
+    
+    return InlineKeyboardMarkup(buttons)
+
+
+def get_target_language_keyboard(source_lang: str) -> InlineKeyboardMarkup:
+    """Target language keyboard (excludes source language)."""
+    buttons = []
+    row = []
+    
+    for code, lang in LANGUAGES.items():
+        if code == source_lang:
+            continue
+        btn = InlineKeyboardButton(
+            f"{lang.flag} {lang.name_native}",
+            callback_data=f"target_lang:{code}"
+        )
+        row.append(btn)
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    
+    if row:
+        buttons.append(row)
+    
+    buttons.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back:main")])
+    
+    return InlineKeyboardMarkup(buttons)
+
+
+# ============== GENIUS LYRICS API ==============
+async def search_genius_lyrics(query: str) -> Optional[Dict]:
+    """Search for lyrics on Genius."""
+    if not GENIUS_API_KEY:
+        logger.info("Genius API key not configured, skipping lyrics search")
+        return None
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Search for song
+            search_url = "https://api.genius.com/search"
+            headers = {"Authorization": f"Bearer {GENIUS_API_KEY}"}
+            params = {"q": query}
+            
+            response = await client.get(search_url, headers=headers, params=params)
+            
+            if response.status_code != 200:
+                logger.warning(f"Genius search failed: {response.status_code}")
+                return None
+            
+            data = response.json()
+            hits = data.get("response", {}).get("hits", [])
+            
+            if not hits:
+                return None
+            
+            # Get first result
+            song = hits[0]["result"]
+            
+            return {
+                "title": song.get("title", ""),
+                "artist": song.get("primary_artist", {}).get("name", ""),
+                "url": song.get("url", ""),
+                "thumbnail": song.get("song_art_image_thumbnail_url", ""),
+            }
+            
+    except Exception as e:
+        logger.error(f"Genius search error: {e}")
+        return None
+
+
+async def get_lyrics_from_url(url: str) -> Optional[str]:
+    """Scrape lyrics from Genius URL."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url)
+            
+            if response.status_code != 200:
+                return None
+            
+            html = response.text
+            
+            # Extract lyrics using regex (Genius stores lyrics in specific divs)
+            # This is a simplified extraction
+            lyrics_pattern = r'<div[^>]*class="[^"]*Lyrics__Container[^"]*"[^>]*>(.*?)</div>'
+            matches = re.findall(lyrics_pattern, html, re.DOTALL)
+            
+            if matches:
+                lyrics = ""
+                for match in matches:
+                    # Clean HTML tags
+                    clean = re.sub(r'<br\s*/?>', '\n', match)
+                    clean = re.sub(r'<[^>]+>', '', clean)
+                    clean = clean.strip()
+                    lyrics += clean + "\n\n"
+                
+                return lyrics.strip() if lyrics.strip() else None
+            
+            return None
+            
+    except Exception as e:
+        logger.error(f"Lyrics scraping error: {e}")
+        return None
+
+
+async def identify_song_from_transcription(transcription: str) -> Optional[Dict]:
+    """Use LLM to identify song from transcription."""
+    if not groq_client:
+        return None
+    
+    try:
+        prompt = """Analyze this transcription which may be from a song.
+
+**YOUR TASK:**
+1. Determine if this is likely song lyrics or spoken content
+2. If it's a song, try to identify:
+   - Song title
+   - Artist name
+   - Any recognizable lyrics phrases
+
+**OUTPUT FORMAT (JSON):**
+{
+    "is_song": true/false,
+    "confidence": "high/medium/low",
+    "title": "song title or null",
+    "artist": "artist name or null", 
+    "search_query": "best search query for this song"
+}
+
+**TRANSCRIPTION:**
+""" + transcription[:1500]
+
+        response = await asyncio.to_thread(
+            lambda: groq_client.chat.completions.create(
+                model=LLM_MODEL_FAST,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.3,
+            )
+        )
+        
+        if response.choices:
+            result_text = response.choices[0].message.content
+            
+            # Try to parse JSON from response
+            json_match = re.search(r'\{[^}]+\}', result_text, re.DOTALL)
+            if json_match:
+                import json
+                try:
+                    return json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    pass
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Song identification error: {e}")
+        return None
+
+
+# ============== AUDIO CONVERSION ==============
+async def convert_audio_to_mp3(audio_data: bytes, original_format: str = "ogg") -> Tuple[Optional[bytes], Optional[str]]:
+    """Convert audio to MP3 format."""
+    try:
+        def _convert():
+            with tempfile.NamedTemporaryFile(suffix=f".{original_format}", delete=False) as input_file:
+                input_file.write(audio_data)
+                input_path = input_file.name
+            
+            try:
+                if original_format in ["ogg", "oga"]:
+                    audio = AudioSegment.from_ogg(input_path)
+                elif original_format == "mp3":
+                    audio = AudioSegment.from_mp3(input_path)
+                elif original_format == "wav":
+                    audio = AudioSegment.from_wav(input_path)
+                elif original_format == "m4a":
+                    audio = AudioSegment.from_file(input_path, format="m4a")
+                else:
+                    audio = AudioSegment.from_file(input_path)
+                
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as output_file:
+                    output_path = output_file.name
+                
+                audio.export(output_path, format="mp3", bitrate="128k")
+                
+                with open(output_path, "rb") as f:
+                    mp3_data = f.read()
+                
+                os.unlink(output_path)
+                return mp3_data, None
+                
+            finally:
+                if os.path.exists(input_path):
+                    os.unlink(input_path)
+        
+        return await asyncio.to_thread(_convert)
+        
+    except Exception as e:
+        logger.error(f"Audio conversion error: {e}")
+        return None, str(e)
+
+
+# ============== GROQ STT ==============
+async def transcribe_audio(audio_data: bytes) -> Tuple[Optional[str], Optional[str]]:
+    """Transcribe audio using Groq Whisper."""
+    if not groq_client:
+        return None, "Groq client not initialized"
+    
+    try:
+        def _transcribe():
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
+                temp_file.write(audio_data)
+                temp_path = temp_file.name
+            
+            try:
+                with open(temp_path, "rb") as audio_file:
+                    transcription = groq_client.audio.transcriptions.create(
+                        model=WHISPER_MODEL,
+                        file=audio_file,
+                        response_format="text",
+                        language=None,  # Auto-detect
+                        temperature=0.0,
+                    )
+                return transcription, None
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+        
+        result, error = await asyncio.to_thread(_transcribe)
+        
+        if error:
+            return None, error
+        
+        if result and len(result.strip()) > 0:
+            logger.info(f"✅ Transcription: {len(result)} chars")
+            return result.strip(), None
+        else:
+            return None, "Empty transcription"
+            
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Transcription error: {error_msg}")
+        return None, error_msg[:100]
+
+
+# ============== GROQ LLM ==============
+async def process_with_llm(
+    text: str,
+    system_prompt: str
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Process text with Groq LLM."""
+    if not groq_client:
+        return None, None, "Groq client not initialized"
+    
+    models = [LLM_MODEL_PRIMARY, LLM_MODEL_FALLBACK, LLM_MODEL_FAST]
+    
+    for model_name in models:
+        try:
+            logger.info(f"🔄 Trying LLM: {model_name}")
+            
+            response = await asyncio.to_thread(
+                lambda m=model_name: groq_client.chat.completions.create(
+                    model=m,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": text}
+                    ],
+                    temperature=0.7,
+                    max_tokens=8000,
+                )
+            )
+            
+            if response.choices and response.choices[0].message.content:
+                result = response.choices[0].message.content.strip()
+                logger.info(f"✅ LLM success: {model_name}")
+                return result, model_name, None
+                
+        except Exception as e:
+            logger.warning(f"❌ {model_name}: {str(e)[:50]}")
+            continue
+    
+    return None, None, "All models failed"
+
+
+# ============== FULL PROCESSING ==============
+async def process_audio_full(
+    audio_data: bytes,
+    mime_type: str,
+    mode: str,
+    lang: str = "fa",
+    source_lang: Optional[str] = None,
+    target_lang: Optional[str] = None,
+) -> Dict:
+    """
+    Full audio processing pipeline.
+    Returns dict with: result, transcription, model, lyrics_source, error
+    """
+    result = {
+        "text": None,
+        "transcription": None,
+        "model": None,
+        "lyrics_source": None,
+        "song_info": None,
+        "error": None,
+    }
+    
+    # Determine format and convert
+    format_map = {
+        "audio/ogg": "ogg", "audio/oga": "ogg", "audio/opus": "ogg",
+        "audio/mp3": "mp3", "audio/mpeg": "mp3",
+        "audio/wav": "wav", "audio/x-wav": "wav",
+        "audio/m4a": "m4a", "audio/mp4": "m4a",
+    }
+    
+    original_format = format_map.get(mime_type, "ogg")
+    
+    if original_format != "mp3":
+        mp3_data, _ = await convert_audio_to_mp3(audio_data, original_format)
+        if not mp3_data:
+            mp3_data = audio_data
+    else:
+        mp3_data = audio_data
+    
+    # Step 1: Transcribe
+    transcription, stt_error = await transcribe_audio(mp3_data)
+    
+    if stt_error:
+        result["error"] = f"❌ خطا در تبدیل صدا: {stt_error}"
+        return result
+    
+    if not transcription:
+        result["error"] = "❌ متنی استخراج نشد"
+        return result
+    
+    result["transcription"] = transcription
+    
+    # Step 2: Process based on mode
+    if mode == "transcript":
+        prompt = get_transcript_prompt(lang)
+        text, model, err = await process_with_llm(transcription, prompt)
+        result["text"] = text or transcription
+        result["model"] = model or WHISPER_MODEL
+        
+    elif mode == "lecture":
+        prompt = get_lecture_prompt(lang)
+        text, model, err = await process_with_llm(transcription, prompt)
+        result["text"] = text
+        result["model"] = model
+        if err:
+            result["error"] = err
+            
+    elif mode == "soap":
+        prompt = get_soap_prompt()
+        text, model, err = await process_with_llm(transcription, prompt)
+        result["text"] = text
+        result["model"] = model
+        if err:
+            result["error"] = err
+            
+    elif mode == "summary":
+        prompt = get_summary_prompt(lang)
+        text, model, err = await process_with_llm(transcription, prompt)
+        result["text"] = text
+        result["model"] = model
+        if err:
+            result["error"] = err
+            
+    elif mode == "lyrics":
+        # Smart lyrics: Try to identify song and search Genius first
+        song_info = await identify_song_from_transcription(transcription)
+        
+        genius_lyrics = None
+        if song_info and song_info.get("is_song"):
+            result["song_info"] = song_info
+            
+            # Search Genius
+            search_query = song_info.get("search_query") or f"{song_info.get('title', '')} {song_info.get('artist', '')}"
+            genius_result = await search_genius_lyrics(search_query)
+            
+            if genius_result:
+                result["song_info"]["genius"] = genius_result
+                genius_lyrics = await get_lyrics_from_url(genius_result["url"])
+                
+                if genius_lyrics:
+                    result["text"] = f"""🎵 **{genius_result['title']}**
+🎤 **{genius_result['artist']}**
+🔗 [Genius]({genius_result['url']})
+
+---
+
+{genius_lyrics}"""
+                    result["lyrics_source"] = "genius"
+                    result["model"] = "Genius API"
+                    return result
+        
+        # Fallback to AI lyrics extraction
+        prompt = get_lyrics_prompt()
+        text, model, err = await process_with_llm(transcription, prompt)
+        result["text"] = text
+        result["model"] = model
+        result["lyrics_source"] = "ai"
+        if err:
+            result["error"] = err
+            
+    elif mode == "translate":
+        if not source_lang or not target_lang:
+            result["error"] = "زبان مبدا و مقصد مشخص نشده"
+            return result
+        
+        prompt = get_translation_prompt(source_lang, target_lang)
+        text, model, err = await process_with_llm(transcription, prompt)
+        result["text"] = text
+        result["model"] = model
+        if err:
+            result["error"] = err
+    
+    return result
+
+
+# ============== TELEGRAM HANDLERS ==============
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /start command."""
     await update.message.reply_text(MESSAGES["welcome"], parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the /help command."""
-    help_text = """📖 **راهنمای استفاده**
+    help_text = """📖 **راهنمای Omni-Hear AI v4.0**
 
-1️⃣ یک فایل صوتی یا ویس ارسال کنید
-2️⃣ از منو نوع پردازش را انتخاب کنید
-3️⃣ منتظر نتیجه بمانید (۱۰-۳۰ ثانیه)
+**🔹 استفاده:**
+1️⃣ فایل صوتی ارسال کنید
+2️⃣ نوع پردازش را انتخاب کنید
+3️⃣ زبان خروجی را انتخاب کنید (در صورت نیاز)
 
-**حالت‌های پردازش:**
+**🔹 حالت‌ها:**
+• 📜 رونویسی - متن کامل صوت
+• 📚 درسنامه - تبدیل به متن آموزشی
+• 🩺 SOAP - شرح‌حال پزشکی
+• 📝 خلاصه - خلاصه نکات مهم
+• 🎵 متن آهنگ - استخراج لیریک با جستجو در Genius
+• 🌍 ترجمه - ترجمه به ۷ زبان
 
-📜 **رونویسی کامل** - متن کامل کلمه به کلمه
-   • تشخیص خودکار زبان (فارسی/انگلیسی)
-   • حفظ کلمات انگلیسی در متن فارسی
+**🔹 زبان‌ها:**
+🇮🇷 فارسی | 🇬🇧 English | 🇫🇷 Français
+🇪🇸 Español | 🇩🇪 Deutsch | 🇷🇺 Русский | 🇸🇦 العربية
 
-📚 **درسنامه کامل** - متن درسی کامل به فارسی
-
-🩺 **شرح‌حال پزشکی** - SOAP Note به انگلیسی
-
-📝 **خلاصه متن** - خلاصه نکات به فارسی
-
-🎵 **متن آهنگ** - استخراج متن/لیریک
-
-💡 حداکثر حجم: ۲۰ مگابایت
-🤖 مدل: Gemini با تشخیص خودکار زبان"""
+**🔹 دستورات:**
+/start - شروع
+/help - راهنما
+/status - وضعیت سرویس"""
+    
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check bot status and API connectivity."""
-    status_parts = ["🔍 **وضعیت سیستم:**\n"]
+    status = ["🔍 **وضعیت سیستم**\n"]
+    status.append("✅ **Telegram:** متصل")
     
-    if TELEGRAM_BOT_TOKEN:
-        status_parts.append("✅ Telegram Token: فعال")
+    if GROQ_API_KEY and groq_client:
+        status.append("✅ **Groq API:** فعال")
     else:
-        status_parts.append("❌ Telegram Token: تنظیم نشده!")
+        status.append("❌ **Groq API:** غیرفعال")
     
-    if GEMINI_API_KEY:
-        status_parts.append("✅ Gemini API Key: تنظیم شده")
-        
-        try:
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            response = await asyncio.to_thread(
-                model.generate_content,
-                "Say 'API Working' in exactly 2 words."
-            )
-            if response.text:
-                status_parts.append("✅ Gemini API: متصل و فعال ✨")
-                status_parts.append(f"   پاسخ تست: {response.text[:50]}")
-        except google_exceptions.ResourceExhausted:
-            status_parts.append("⚠️ Gemini API: Quota تمام شده!")
-            status_parts.append("   💡 نیاز به API Key جدید دارید")
-        except google_exceptions.InvalidArgument:
-            status_parts.append("❌ Gemini API: خطای پارامتر")
-        except Exception as e:
-            status_parts.append(f"❌ Gemini API Error: {str(e)[:80]}")
+    if GENIUS_API_KEY:
+        status.append("✅ **Genius API:** فعال (جستجوی لیریک)")
     else:
-        status_parts.append("❌ Gemini API Key: تنظیم نشده!")
+        status.append("⚠️ **Genius API:** غیرفعال (اختیاری)")
     
-    status_parts.append(f"\n🔄 مدل‌ها:\n   " + "\n   ".join(MODEL_PRIORITY))
+    status.append(f"\n**🤖 مدل‌ها:**")
+    status.append(f"• STT: `{WHISPER_MODEL}`")
+    status.append(f"• LLM: `{LLM_MODEL_PRIMARY}`")
     
-    await update.message.reply_text("\n".join(status_parts), parse_mode="Markdown")
-
-
-async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List available models."""
-    try:
-        models_list = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                models_list.append(f"• `{m.name.replace('models/', '')}`")
-        
-        if models_list:
-            text = "🤖 **مدل‌های موجود:**\n\n" + "\n".join(models_list[:15])
-            if len(models_list) > 15:
-                text += f"\n\n... و {len(models_list) - 15} مدل دیگر"
-        else:
-            text = "❌ هیچ مدلی یافت نشد!"
-            
-        await update.message.reply_text(text, parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا: {str(e)[:100]}")
+    status.append(f"\n**🌍 زبان‌ها:** {len(LANGUAGES)} زبان پشتیبانی")
+    
+    await update.message.reply_text("\n".join(status), parse_mode="Markdown")
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming audio files and voice messages."""
     user_id = update.effective_user.id
     msg = update.message
     
-    if not GEMINI_API_KEY:
+    if not GROQ_API_KEY or not groq_client:
         await msg.reply_text(MESSAGES["api_key_missing"])
         return
     
@@ -267,29 +921,19 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file_type = "voice"
     elif msg.audio:
         audio_file = msg.audio
-    elif msg.document:
-        if msg.document.mime_type and msg.document.mime_type.startswith("audio/"):
-            audio_file = msg.document
-        else:
-            await msg.reply_text(MESSAGES["not_audio"])
-            return
+    elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("audio/"):
+        audio_file = msg.document
     else:
         await msg.reply_text(MESSAGES["not_audio"])
         return
     
     file_size = getattr(audio_file, 'file_size', 0)
     if file_size and file_size > MAX_FILE_SIZE:
-        logger.warning(f"User {user_id}: file too large ({file_size} bytes)")
         await msg.reply_text(MESSAGES["file_too_large"])
         return
     
     try:
         file = await context.bot.get_file(audio_file.file_id)
-        
-        if file.file_size and file.file_size > MAX_FILE_SIZE:
-            await msg.reply_text(MESSAGES["file_too_large"])
-            return
-        
         audio_bytes = await file.download_as_bytearray()
         
         if file_type == "voice":
@@ -301,215 +945,251 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
         user_audio_cache[user_id] = {
             "data": bytes(audio_bytes),
-            "mime_type": mime_type
+            "mime_type": mime_type,
         }
         
-        logger.info(f"✅ Audio cached: user={user_id}, size={len(audio_bytes)}, mime={mime_type}")
-        await msg.reply_text(MESSAGES["audio_received"], reply_markup=get_menu_keyboard())
+        # Clear any previous state
+        user_state.pop(user_id, None)
+        
+        logger.info(f"✅ Audio cached: user={user_id}, size={len(audio_bytes)}")
+        
+        await msg.reply_text(
+            MESSAGES["audio_received"],
+            reply_markup=get_main_menu_keyboard(),
+            parse_mode="Markdown"
+        )
         
     except Exception as e:
-        logger.error(f"Error downloading audio for user {user_id}: {e}")
+        logger.error(f"Audio download error: {e}")
         await msg.reply_text(MESSAGES["error"])
 
 
-async def process_with_cascade(
-    audio_data: bytes,
-    mime_type: str,
-    mode: str
-) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Process audio with model cascade.
-    Returns: (result_text, model_used, error_message)
-    """
-    audio_b64 = base64.standard_b64encode(audio_data).decode("utf-8")
-    last_error = None
-    quota_exhausted = False
-    
-    prompt = PROMPTS.get(mode, PROMPTS["summary"])
-    
-    for i, model_name in enumerate(MODEL_PRIORITY):
-        try:
-            logger.info(f"🔄 Trying model {i+1}/{len(MODEL_PRIORITY)}: {model_name}")
-            
-            model = genai.GenerativeModel(model_name)
-            
-            response = await asyncio.to_thread(
-                model.generate_content,
-                [
-                    {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
-                    prompt
-                ],
-                generation_config={
-                    "temperature": 0.7,
-                    "max_output_tokens": 8192
-                }
-            )
-            
-            if response.text:
-                logger.info(f"✅ Success with: {model_name}")
-                return response.text, model_name, None
-            else:
-                logger.warning(f"⚠️ Empty response from {model_name}")
-                last_error = "پاسخ خالی از مدل"
-                continue
-                
-        except google_exceptions.NotFound as e:
-            logger.warning(f"❌ {model_name} - Not found: {str(e)[:50]}")
-            last_error = f"مدل {model_name} یافت نشد"
-            continue
-            
-        except google_exceptions.ResourceExhausted:
-            logger.warning(f"❌ {model_name} - Quota exhausted")
-            quota_exhausted = True
-            last_error = "سقف استفاده رایگان API تمام شده"
-            continue
-            
-        except google_exceptions.InvalidArgument as e:
-            error_str = str(e)
-            logger.warning(f"❌ {model_name} - Invalid: {error_str[:80]}")
-            if "audio" in error_str.lower():
-                last_error = "این مدل از صدا پشتیبانی نمی‌کند"
-            else:
-                last_error = f"پارامتر نامعتبر: {error_str[:50]}"
-            continue
-            
-        except google_exceptions.PermissionDenied:
-            logger.error(f"❌ {model_name} - Permission denied")
-            last_error = "API Key معتبر نیست یا دسترسی ندارید"
-            continue
-            
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"❌ {model_name} - Error: {error_msg[:100]}")
-            last_error = error_msg[:80]
-            continue
-    
-    if quota_exhausted:
-        final_error = "⚠️ سقف استفاده رایگان API تمام شده!\n\n💡 لطفاً:\n• چند دقیقه صبر کنید\n• یا API Key جدید بگیرید"
-    else:
-        final_error = last_error or "خطای ناشناخته"
-    
-    logger.error(f"❌ All models failed! Last error: {last_error}")
-    return None, None, final_error
-
-
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle button callbacks."""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
-    mode = query.data
+    data = query.data
+    
+    # Parse callback data
+    parts = data.split(":")
+    action = parts[0]
+    value = parts[1] if len(parts) > 1 else None
+    
+    # Handle back button
+    if action == "back":
+        if user_id in user_audio_cache:
+            await query.edit_message_text(
+                MESSAGES["audio_received"],
+                reply_markup=get_main_menu_keyboard(),
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(MESSAGES["no_audio"])
+        user_state.pop(user_id, None)
+        return
+    
+    # Handle mode selection
+    if action == "mode":
+        mode = value
+        
+        if user_id not in user_audio_cache:
+            await query.edit_message_text(MESSAGES["no_audio"])
+            return
+        
+        # Modes that need language selection
+        if mode in ["transcript", "lecture", "summary"]:
+            user_state[user_id] = {"mode": mode, "step": "select_lang"}
+            await query.edit_message_text(
+                MESSAGES["select_language"],
+                reply_markup=get_language_keyboard(f"lang_{mode}"),
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Translation needs source and target language
+        if mode == "translate":
+            user_state[user_id] = {"mode": mode, "step": "select_source"}
+            await query.edit_message_text(
+                MESSAGES["select_source_lang"],
+                reply_markup=get_language_keyboard("source_lang"),
+                parse_mode="Markdown"
+            )
+            return
+        
+        # SOAP and Lyrics - process directly
+        await process_and_respond(query, context, user_id, mode)
+        return
+    
+    # Handle language selection for transcript/lecture/summary
+    if action.startswith("lang_"):
+        mode = action.replace("lang_", "")
+        lang = value
+        await process_and_respond(query, context, user_id, mode, lang=lang)
+        return
+    
+    # Handle source language for translation
+    if action == "source_lang":
+        source = value
+        user_state[user_id] = {
+            "mode": "translate",
+            "step": "select_target",
+            "source_lang": source
+        }
+        await query.edit_message_text(
+            MESSAGES["select_target_lang"],
+            reply_markup=get_target_language_keyboard(source),
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Handle target language for translation
+    if action == "target_lang":
+        target = value
+        state = user_state.get(user_id, {})
+        source = state.get("source_lang", "en")
+        await process_and_respond(
+            query, context, user_id, "translate",
+            source_lang=source, target_lang=target
+        )
+        return
+
+
+async def process_and_respond(
+    query,
+    context,
+    user_id: int,
+    mode: str,
+    lang: str = "fa",
+    source_lang: Optional[str] = None,
+    target_lang: Optional[str] = None,
+) -> None:
+    """Process audio and send response."""
     
     if user_id not in user_audio_cache:
         await query.edit_message_text(MESSAGES["no_audio"])
         return
     
+    audio_info = user_audio_cache[user_id]
+    
+    # Mode display names
+    mode_names = {
+        "transcript": "📜 رونویسی",
+        "lecture": "📚 درسنامه",
+        "soap": "🩺 SOAP",
+        "summary": "📝 خلاصه",
+        "lyrics": "🎵 متن آهنگ",
+        "translate": "🌍 ترجمه",
+    }
+    
     try:
-        audio_info = user_audio_cache[user_id]
+        # Show processing message
+        processing_msg = f"🎯 **{mode_names.get(mode, mode)}**\n\n{MESSAGES['processing_stt']}"
+        if mode == "translate" and source_lang and target_lang:
+            src = LANGUAGES.get(source_lang, LANGUAGES["en"])
+            tgt = LANGUAGES.get(target_lang, LANGUAGES["fa"])
+            processing_msg += f"\n\n{src.flag} {src.name_native} → {tgt.flag} {tgt.name_native}"
         
-        mode_names = {
-            "transcript": "📜 رونویسی کامل",
-            "lecture": "📚 درسنامه کامل",
-            "soap": "🩺 شرح‌حال پزشکی",
-            "summary": "📝 خلاصه متن",
-            "lyrics": "🎵 متن آهنگ"
-        }
+        await query.edit_message_text(processing_msg, parse_mode="Markdown")
         
-        await query.edit_message_text(
-            f"{MESSAGES['processing']}\n\n🎯 حالت: {mode_names.get(mode, mode)}"
-        )
-        
-        result, model_used, error = await process_with_cascade(
+        # Process audio
+        result = await process_audio_full(
             audio_info["data"],
             audio_info["mime_type"],
-            mode
+            mode,
+            lang=lang,
+            source_lang=source_lang,
+            target_lang=target_lang,
         )
         
-        if result:
-            header = f"✅ **{mode_names.get(mode, 'پردازش')} کامل شد**\n\n"
-            footer = f"\n\n---\n🤖 مدل: `{model_used}`"
-            full_text = header + result + footer
-            
-            if len(full_text) > 4000:
-                try:
-                    await query.edit_message_text(full_text[:4000], parse_mode="Markdown")
-                except Exception:
-                    await query.edit_message_text(full_text[:4000])
-                
-                remaining = full_text[4000:]
-                while remaining:
-                    chunk = remaining[:4000]
-                    remaining = remaining[4000:]
-                    await asyncio.sleep(0.5)
-                    try:
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=chunk,
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=chunk
-                        )
+        if result["error"]:
+            await query.edit_message_text(result["error"])
+            return
+        
+        if not result["text"]:
+            await query.edit_message_text(MESSAGES["error"])
+            return
+        
+        # Build response
+        header = f"✅ **{mode_names.get(mode, mode)}**\n\n"
+        
+        # Add lyrics source info
+        if mode == "lyrics":
+            if result["lyrics_source"] == "genius":
+                header = f"✅ **{MESSAGES['lyrics_found']}**\n\n"
             else:
-                try:
-                    await query.edit_message_text(full_text, parse_mode="Markdown")
-                except Exception:
-                    await query.edit_message_text(full_text)
+                header = f"✅ **{MESSAGES['lyrics_ai']}**\n\n"
+        
+        # Add translation info
+        if mode == "translate" and source_lang and target_lang:
+            src = LANGUAGES.get(source_lang)
+            tgt = LANGUAGES.get(target_lang)
+            header += f"{src.flag} → {tgt.flag}\n\n"
+        
+        footer = f"\n\n---\n🤖 `{result['model']}`"
+        
+        full_text = header + result["text"] + footer
+        
+        # Send response (handle long messages)
+        if len(full_text) > 4000:
+            await query.edit_message_text(full_text[:4000], parse_mode="Markdown")
+            remaining = full_text[4000:]
+            while remaining:
+                chunk = remaining[:4000]
+                remaining = remaining[4000:]
+                await asyncio.sleep(0.3)
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=chunk,
+                    parse_mode="Markdown"
+                )
         else:
-            await query.edit_message_text(f"❌ {error}")
+            try:
+                await query.edit_message_text(full_text, parse_mode="Markdown")
+            except Exception:
+                await query.edit_message_text(full_text)
     
     except Exception as e:
-        logger.error(f"Callback error for user {user_id}: {e}")
+        logger.error(f"Process error: {e}")
         logger.error(traceback.format_exc())
-        try:
-            await query.edit_message_text(f"❌ خطا: {str(e)[:100]}")
-        except Exception:
-            pass
+        await query.edit_message_text(f"❌ خطا: {str(e)[:100]}")
     
     finally:
-        if user_id in user_audio_cache:
-            del user_audio_cache[user_id]
-            logger.info(f"🧹 Cache cleaned: user={user_id}")
+        # Cleanup
+        user_audio_cache.pop(user_id, None)
+        user_state.pop(user_id, None)
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors."""
     logger.error(f"Error: {context.error}")
-    if update:
-        logger.error(f"Update: {update}")
 
 
+# ============== MAIN ==============
 def main() -> None:
-    """Start the bot."""
-    print("\n" + "="*60)
-    print("  🎧 OMNI-HEAR AI v2.5 - Full Transcript + Auto Language")
-    print("="*60)
+    print("\n" + "="*65)
+    print("  🎧 OMNI-HEAR AI v4.0 - MULTILINGUAL EDITION")
+    print("  🌍 7 Languages | 🎵 Smart Lyrics | 🔄 Translation")
+    print("="*65)
     
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("❌ TELEGRAM_BOT_TOKEN not set!")
-        print("\n⚠️  Set: TELEGRAM_BOT_TOKEN=your_token")
+        print("❌ TELEGRAM_BOT_TOKEN not set!")
         sys.exit(1)
     
-    if not GEMINI_API_KEY:
-        logger.error("❌ GEMINI_API_KEY not set!")
-        print("\n⚠️  Set: GEMINI_API_KEY=your_key")
-        print("   Get it from: https://aistudio.google.com/app/apikey")
+    if not GROQ_API_KEY:
+        print("❌ GROQ_API_KEY not set!")
         sys.exit(1)
     
-    print(f"✅ Telegram: Connected")
-    print(f"✅ Gemini: Configured")
-    print(f"🔄 Models: {' → '.join(MODEL_PRIORITY)}")
-    print("="*60 + "\n")
+    print(f"✅ Telegram: Ready")
+    print(f"✅ Groq: Configured")
+    print(f"{'✅' if GENIUS_API_KEY else '⚠️'} Genius: {'Configured' if GENIUS_API_KEY else 'Not configured (optional)'}")
+    print(f"🌍 Languages: {', '.join([l.flag for l in LANGUAGES.values()])}")
+    print("="*65 + "\n")
     
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("models", models_command))
     app.add_handler(MessageHandler(
         filters.VOICE | filters.AUDIO | filters.Document.AUDIO,
         handle_audio
