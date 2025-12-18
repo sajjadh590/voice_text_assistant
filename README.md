@@ -1,34 +1,26 @@
 ---
-title: Omni-Hear AI v6.0 Dual-Engine
+title: Omni-Hear AI v7.0
 emoji: 🎧
-colorFrom: blue
-colorTo: purple
+colorFrom: green
+colorTo: blue
 sdk: docker
 pinned: false
 license: mit
 ---
 
-# 🎧 Omni-Hear AI v6.0 - Dual-Engine Edition
+# 🎧 Omni-Hear AI v7.0 - AssemblyAI + Groq
 
-## ⚡ Two Processing Modes
+## ⚡ Architecture
 
-| Mode | Engine | Speed | Quality |
-|------|--------|-------|---------|
-| ⚡ Fast | Groq Llama 70B | ~3 sec | Good |
-| 🚀 Pro | SambaNova 405B | ~10 sec | Best |
-
-## 🎯 Features with Dual Options
-
-- 📜 Transcript (⚡/🚀)
-- 📚 Academic Lecture (⚡/🚀)
-- 🩺 Medical SOAP (⚡/🚀)
-- 📝 Summary (⚡/🚀)
-- 🎵 Lyrics (⚡/🚀)
-- 🌍 Translation (⚡/🚀)
+| Component | Provider | Model |
+|-----------|----------|-------|
+| 🎤 STT | AssemblyAI | Best-in-class |
+| ⚡ Fast LLM | Groq | Llama 3.1 8B |
+| 🧠 Complex LLM | Groq | Llama 3.3 70B |
 
 ## 🔑 Environment Variables
 
 ```bash
 TELEGRAM_BOT_TOKEN=xxx
+ASSEMBLYAI_API_KEY=xxx
 GROQ_API_KEY=xxx
-SAMBANOVA_API_KEY=xxx  # Optional for Pro mode
