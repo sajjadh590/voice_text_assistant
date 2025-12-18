@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                   OMNI-HEAR AI v6.0 (Dual-Engine Edition)                    ║
-║            ⚡ Fast Mode (Groq 70B) | 🚀 Pro Mode (SambaNova 405B)            ║
+║                OMNI-HEAR AI v7.0 (AssemblyAI + Groq Edition)                 ║
+║         🎤 AssemblyAI STT | 🧠 Groq Dual-LLM | 🔄 Persistent Sessions        ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  🎤 STT: Groq Whisper Large V3 (with context prompting)                      ║
-║  ⚡ Fast LLM: Groq Llama 3.3 70B (~3 seconds)                                ║
-║  🚀 Pro LLM: SambaNova Llama 3.1 405B (Maximum Accuracy)                     ║
-║  🌍 7 Languages | 🔄 Auto-Fallback | 📊 Dual-Button UI                       ║
+║  🎤 STT: AssemblyAI (Best-in-class accuracy + Language Detection)            ║
+║  ⚡ Fast LLM: Groq Llama 3.1 8B Instant                                      ║
+║  🧠 Complex LLM: Groq Llama 3.3 70B Versatile                                ║
+║  🔄 Persistent Audio: Process same file multiple times                       ║
+║  🌍 7 Languages | Auto Language Detection | Progress Tracking                ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -17,6 +18,7 @@ import logging
 import asyncio
 import tempfile
 import traceback
+import time
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
 from enum import Enum
@@ -31,8 +33,8 @@ from telegram.ext import (
     filters,
 )
 
+import assemblyai as aai
 from groq import Groq
-from openai import OpenAI
 from pydub import AudioSegment
 
 # ============== LOGGING ==============
@@ -44,48 +46,52 @@ logger = logging.getLogger(__name__)
 
 # ============== CONFIGURATION ==============
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-SAMBANOVA_API_KEY = os.getenv("SAMBANOVA_API_KEY")
 
 # ============== API CLIENTS ==============
 groq_client: Optional[Groq] = None
-sambanova_client: Optional[OpenAI] = None
+aai_transcriber = None
 
+# Initialize AssemblyAI
+if ASSEMBLYAI_API_KEY:
+    aai.settings.api_key = ASSEMBLYAI_API_KEY
+    logger.info("✅ AssemblyAI configured")
+else:
+    logger.error("❌ ASSEMBLYAI_API_KEY not set!")
+
+# Initialize Groq
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
     logger.info("✅ Groq client initialized")
 else:
     logger.error("❌ GROQ_API_KEY not set!")
 
-if SAMBANOVA_API_KEY:
-    sambanova_client = OpenAI(
-        api_key=SAMBANOVA_API_KEY,
-        base_url="https://api.sambanova.ai/v1"
-    )
-    logger.info("✅ SambaNova client initialized")
-else:
-    logger.warning("⚠️ SAMBANOVA_API_KEY not set - Pro mode unavailable")
-
 # ============== MODEL CONFIGURATION ==============
-WHISPER_MODEL = "whisper-large-v3"
-GROQ_LLM_PRIMARY = "llama-3.3-70b-versatile"
-GROQ_LLM_FALLBACK = "llama-3.1-8b-instant"
-SAMBANOVA_MODEL_PRO = "Meta-Llama-3.1-405B-Instruct"
-SAMBANOVA_MODEL_FALLBACK = "Meta-Llama-3.1-70B-Instruct"
+# Groq Models
+GROQ_MODEL_FAST = "llama-3.1-8b-instant"        # Fast: Transcript, Lyrics, Quick tasks
+GROQ_MODEL_COMPLEX = "llama-3.3-70b-versatile"  # Complex: Lecture, SOAP, Detailed tasks
 
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
-
-# Whisper context prompt for better accuracy
-WHISPER_CONTEXT_PROMPT = """Medical terminology: SOAP, diagnosis, patient, symptoms, treatment, prescription, 
-blood pressure, cardiac, respiratory, neurological, assessment, differential diagnosis.
-Academic terms: professor, lecture, university, chapter, introduction, conclusion, methodology.
-Persian academic: درس، استاد، دانشگاه، فصل، مقدمه، نتیجه‌گیری، تشخیص، بیمار، درمان."""
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB (Telegram limit)
 
 
-# ============== ENGINE TYPES ==============
-class Engine(Enum):
-    FAST = "fast"   # Groq 70B
-    PRO = "pro"     # SambaNova 405B
+# ============== TASK COMPLEXITY ==============
+class TaskComplexity(Enum):
+    FAST = "fast"       # Simple tasks - 8B model
+    COMPLEX = "complex"  # Heavy tasks - 70B model
+
+
+# Mode to complexity mapping
+MODE_COMPLEXITY = {
+    "transcript": TaskComplexity.FAST,
+    "lyrics": TaskComplexity.FAST,
+    "summary_quick": TaskComplexity.FAST,
+    "translate_quick": TaskComplexity.FAST,
+    "lecture": TaskComplexity.COMPLEX,
+    "soap": TaskComplexity.COMPLEX,
+    "summary_detailed": TaskComplexity.COMPLEX,
+    "translate_detailed": TaskComplexity.COMPLEX,
+}
 
 
 # ============== LANGUAGES ==============
@@ -95,36 +101,161 @@ class Language:
     name_en: str
     name_native: str
     flag: str
+    assemblyai_code: str  # AssemblyAI language code
 
 
 LANGUAGES: Dict[str, Language] = {
-    "fa": Language("fa", "Persian", "فارسی", "🇮🇷"),
-    "en": Language("en", "English", "English", "🇬🇧"),
-    "fr": Language("fr", "French", "Français", "🇫🇷"),
-    "es": Language("es", "Spanish", "Español", "🇪🇸"),
-    "ru": Language("ru", "Russian", "Русский", "🇷🇺"),
-    "de": Language("de", "German", "Deutsch", "🇩🇪"),
-    "ar": Language("ar", "Arabic", "العربية", "🇸🇦"),
+    "fa": Language("fa", "Persian", "فارسی", "🇮🇷", "fa"),
+    "en": Language("en", "English", "English", "🇬🇧", "en"),
+    "fr": Language("fr", "French", "Français", "🇫🇷", "fr"),
+    "es": Language("es", "Spanish", "Español", "🇪🇸", "es"),
+    "ru": Language("ru", "Russian", "Русский", "🇷🇺", "ru"),
+    "de": Language("de", "German", "Deutsch", "🇩🇪", "de"),
+    "ar": Language("ar", "Arabic", "العربية", "🇸🇦", "ar"),
 }
 
-# ============== USER STATE ==============
-user_audio_cache: Dict[int, dict] = {}
-user_state: Dict[int, dict] = {}
+# AssemblyAI language code to our code mapping
+AAI_LANG_MAP = {
+    "fa": "fa", "en": "en", "en_us": "en", "en_uk": "en", "en_au": "en",
+    "fr": "fr", "es": "es", "ru": "ru", "de": "de", "ar": "ar",
+}
 
 
-# ============== ADVANCED SYSTEM PROMPTS ==============
+# ============== USER STATE (PERSISTENT) ==============
+user_audio_cache: Dict[int, dict] = {}  # Stores audio data
+user_state: Dict[int, dict] = {}        # Stores workflow state
 
-def get_soap_prompt_pro() -> str:
-    """Advanced Medical SOAP prompt for 405B Pro Engine."""
-    return """Role: Senior Board-Certified Attending Physician with 20+ years of clinical experience at a major academic medical center.
 
-Task: Transform the provided medical dictation into a comprehensive, US Medical Standard clinical SOAP Note that meets Joint Commission (JCAHO) documentation requirements.
+def get_cached_audio(user_id: int) -> Optional[dict]:
+    """Get cached audio for user."""
+    return user_audio_cache.get(user_id)
 
-DOCUMENTATION STANDARDS:
-- Follow CMS Documentation Guidelines
-- Include all medically necessary information
-- Use standard medical abbreviations appropriately
-- Maintain HIPAA-compliant language
+
+def clear_user_cache(user_id: int):
+    """Clear all cached data for user."""
+    user_audio_cache.pop(user_id, None)
+    user_state.pop(user_id, None)
+
+
+# ============== SYSTEM PROMPTS ==============
+
+def get_transcript_prompt(detected_lang: str) -> str:
+    """Simple transcript formatting prompt."""
+    lang = LANGUAGES.get(detected_lang, LANGUAGES["en"])
+    return f"""You are a professional transcription editor.
+
+TASK: Clean and format this raw transcription.
+
+RULES:
+1. Fix obvious errors while preserving meaning
+2. Add proper punctuation (. , ? ! :)
+3. Create logical paragraphs
+4. Mark multiple speakers as [Speaker 1], [Speaker 2]
+5. Keep the ORIGINAL language ({lang.name_en})
+6. Preserve mixed-language words as-is
+
+OUTPUT: Formatted transcription in {lang.name_en}."""
+
+
+def get_lecture_prompt(detected_lang: str) -> str:
+    """Academic lecture prompt - outputs in detected language."""
+    lang = LANGUAGES.get(detected_lang, LANGUAGES["fa"])
+    
+    if detected_lang == "fa":
+        return """نقش: استاد برجسته دانشگاه با تجربه ۲۰ ساله در تدریس و نگارش کتب مرجع.
+
+وظیفه: تبدیل رونویسی این صوت آموزشی به یک **فصل جامع کتاب درسی** به زبان فارسی.
+
+═══════════════════════════════════════════════════════════════
+                      📚 فصل درسی آکادمیک
+═══════════════════════════════════════════════════════════════
+
+ساختار الزامی:
+
+**۱. مقدمه علمی**
+━━━━━━━━━━━━━━━━━━━
+- تعریف موضوع
+- اهمیت علمی/بالینی
+- اهداف یادگیری
+
+**۲. متن اصلی**
+━━━━━━━━━━━━━━━━━━━
+- تقسیم‌بندی با **عناوین بولد**
+- توضیح گام‌به‌گام از ساده به پیچیده
+- مثال‌های کاربردی
+
+**۳. نکات کلیدی (Clinical Pearls) 💎**
+━━━━━━━━━━━━━━━━━━━
+- نکات مهم برای حفظ کردن
+- اشتباهات رایج
+
+**۴. جدول خلاصه 📊**
+━━━━━━━━━━━━━━━━━━━
+| موضوع | توضیح |
+|-------|-------|
+
+**۵. خلاصه فصل**
+━━━━━━━━━━━━━━━━━━━
+- مرور نکات کلیدی
+
+**۶. سؤالات مروری**
+━━━━━━━━━━━━━━━━━━━
+- ۳ سؤال خودآزمایی
+
+═══════════════════════════════════════════════════════════════
+
+الزامات نگارشی:
+• زبان فارسی رسمی و آکادمیک
+• اصطلاحات تخصصی فارسی + (معادل انگلیسی)
+• بدون کلمات عامیانه
+
+زبان خروجی: فقط فارسی"""
+
+    elif detected_lang == "ar":
+        return """الدور: أستاذ جامعي متميز.
+المهمة: تحويل هذا النص إلى فصل كتاب أكاديمي شامل باللغة العربية.
+الهيكل: مقدمة، محتوى رئيسي مع عناوين، نقاط رئيسية، جدول، ملخص، أسئلة.
+لغة الإخراج: العربية فقط"""
+
+    else:
+        return f"""Role: Distinguished University Professor with 20+ years of teaching experience.
+
+Task: Transform this transcription into a comprehensive **Textbook Chapter** in {lang.name_en}.
+
+STRUCTURE:
+
+## 1. Introduction
+- Topic definition
+- Scientific importance
+- Learning objectives
+
+## 2. Main Content
+- Organized with **bold headers**
+- Step-by-step explanations
+- Practical examples
+
+## 3. Clinical Pearls 💎
+- Key points to remember
+- Common mistakes
+
+## 4. Summary Table 📊
+| Topic | Description |
+|-------|-------------|
+
+## 5. Chapter Summary
+- Key points review
+
+## 6. Review Questions
+- 3 self-assessment questions
+
+OUTPUT LANGUAGE: {lang.name_en} ONLY"""
+
+
+def get_soap_prompt() -> str:
+    """Medical SOAP note - always English."""
+    return """Role: Senior Board-Certified Attending Physician.
+
+Task: Transform this medical dictation into a US Medical Standard SOAP Note.
 
 FORMAT:
 
@@ -132,539 +263,194 @@ FORMAT:
                          SOAP NOTE
 ═══════════════════════════════════════════════════════════════
 
-📋 SUBJECTIVE
+📋 **SUBJECTIVE**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**Chief Complaint (CC):**
-[Primary reason for visit - patient's own words in quotes]
+**Chief Complaint (CC):** [Patient's words]
 
 **History of Present Illness (HPI):**
-Capture with chronological precision using OLDCARTS:
-- Onset: [When did it start?]
-- Location: [Where is the problem?]
-- Duration: [How long does it last?]
-- Character: [What does it feel like?]
-- Aggravating Factors: [What makes it worse?]
-- Relieving Factors: [What makes it better?]
-- Timing: [When does it occur?]
-- Severity: [Rate 1-10]
-- Associated Symptoms: [Related symptoms]
+- Onset:
+- Location:
+- Duration:
+- Character:
+- Aggravating/Alleviating:
+- Severity (1-10):
 
 **Review of Systems (ROS):**
-□ Constitutional: [Fever, weight changes, fatigue]
-□ HEENT: [Head, eyes, ears, nose, throat]
-□ Cardiovascular: [Chest pain, palpitations, edema]
-□ Respiratory: [Dyspnea, cough, wheezing]
-□ Gastrointestinal: [Nausea, vomiting, abdominal pain]
-□ Genitourinary: [Dysuria, frequency, hematuria]
-□ Musculoskeletal: [Joint pain, stiffness, swelling]
-□ Neurological: [Headache, dizziness, weakness]
-□ Psychiatric: [Mood, anxiety, sleep]
-□ Integumentary: [Rash, lesions, changes]
+□ Constitutional | □ HEENT | □ Cardiovascular | □ Respiratory
+□ GI | □ GU | □ MSK | □ Neuro | □ Psych | □ Skin
 
-**Past Medical History (PMH):**
-**Past Surgical History (PSH):**
-**Medications:** [Include dose, frequency, route]
-**Allergies:** [Drug allergies with reaction type - NKDA if none]
-**Family History (FHx):**
-**Social History (SHx):**
-- Tobacco: [Pack-years or never]
-- Alcohol: [Drinks per week]
-- Illicit drugs: [Yes/No, type if yes]
-- Occupation:
-- Living situation:
+**PMH:** | **PSH:** | **Medications:** | **Allergies:**
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🔬 OBJECTIVE
+🔬 **OBJECTIVE**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**Vital Signs:**
-| Parameter | Value | Reference |
-|-----------|-------|-----------|
-| BP | /mmHg | <120/80 |
-| HR | bpm | 60-100 |
-| RR | /min | 12-20 |
-| Temp | °F (°C) | 97.8-99.1°F |
-| SpO2 | % | >95% |
-| Weight | kg/lbs | |
-| Height | cm/in | |
-| BMI | kg/m² | 18.5-24.9 |
+**Vitals:** BP: /mmHg | HR: bpm | RR: /min | Temp: °F | SpO2: %
 
-**Physical Examination:**
+**Physical Exam:**
+- General:
+- HEENT:
+- Cardiovascular:
+- Pulmonary:
+- Abdomen:
+- Extremities:
+- Neuro:
 
-*General:* [Appearance, distress level, cooperation]
-
-*HEENT:*
-- Head: [Normocephalic, atraumatic]
-- Eyes: [PERRLA, EOM intact, conjunctivae]
-- Ears: [TMs, canals]
-- Nose: [Patency, mucosa]
-- Throat: [Oropharynx, tonsils, uvula]
-
-*Neck:* [Supple, lymphadenopathy, thyroid, JVD]
-
-*Cardiovascular:* [Rate, rhythm, murmurs, S1/S2, peripheral pulses, edema]
-
-*Pulmonary:* [Effort, breath sounds, wheezes, rhonchi, rales]
-
-*Abdomen:* [Soft, tenderness, distension, bowel sounds, organomegaly]
-
-*Extremities:* [Edema, cyanosis, clubbing, ROM]
-
-*Neurological:* [Mental status, cranial nerves, motor, sensory, reflexes, gait]
-
-*Skin:* [Color, turgor, lesions, rashes]
-
-**Diagnostic Results:**
-
-*Laboratory:*
-| Test | Result | Reference Range | Flag |
-|------|--------|-----------------|------|
-| | | | |
-
-*Imaging:*
-[Modality, findings, impression]
-
-*Other Studies:*
-[EKG, PFTs, etc.]
+**Labs/Imaging:**
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🎯 ASSESSMENT
+🎯 **ASSESSMENT**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**Primary Diagnosis:**
-[Diagnosis] — ICD-10: [Code]
+**Primary Diagnosis:** [Diagnosis] — ICD-10: [Code]
 
-**Differential Diagnoses (Prioritized):**
-1. [Most likely] — ICD-10: [Code]
-   - Supporting evidence:
-   - Against:
-2. [Second likely] — ICD-10: [Code]
-3. [Third likely] — ICD-10: [Code]
-
-**Clinical Reasoning:**
-[Brief explanation of diagnostic thought process]
-
-**Risk Stratification:**
-[Low/Moderate/High risk with justification]
+**Differential:**
+1. [DDx 1]
+2. [DDx 2]
+3. [DDx 3]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📋 PLAN
+📋 **PLAN**
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**Diagnostic Plan:**
-- [ ] [Tests to order with rationale]
-
-**Therapeutic Plan:**
-- [ ] [Medications: Drug, Dose, Route, Frequency, Duration]
-- [ ] [Procedures]
-- [ ] [Therapies]
-
-**Patient Education:**
-- [ ] [Key points discussed]
-- [ ] [Warning signs to watch for]
-- [ ] [Lifestyle modifications]
-
-**Disposition:**
-☐ Discharge home
-☐ Admit to: [Unit]
-☐ Transfer to: [Facility]
-☐ Observation
-
-**Follow-up:**
-- [Timeframe]: [Provider/Specialty]
-- Return precautions: [Specific symptoms]
-
-**Referrals:**
-- [ ] [Specialty]: [Reason]
+**Diagnostics:** [ ]
+**Treatment:** [ ]
+**Medications:** [ ]
+**Patient Education:** [ ]
+**Follow-up:** [ ]
+**Referrals:** [ ]
 
 ═══════════════════════════════════════════════════════════════
-
-CRITICAL INSTRUCTIONS:
-1. OUTPUT MUST BE IN ENGLISH ONLY
-2. Correct any medical mispronunciations from transcription
-3. Use standard medical terminology and abbreviations
-4. Include ICD-10 codes for all diagnoses
-5. If information not provided, mark as "Not documented" or "Not assessed"
-6. Flag any critical or concerning findings with ⚠️
-7. Maintain formal, objective clinical tone throughout"""
-
-
-def get_soap_prompt_fast() -> str:
-    """Simplified SOAP prompt for Fast Engine."""
-    return """You are an experienced physician. Create a SOAP Note from this medical dictation.
-
-FORMAT:
-## SUBJECTIVE
-- CC, HPI, ROS, PMH, Medications, Allergies
-
-## OBJECTIVE  
-- Vitals, Physical Exam, Labs/Imaging
-
-## ASSESSMENT
-- Diagnosis with ICD-10 codes
-- Differential diagnoses
-
-## PLAN
-- Treatment, medications, follow-up
-
-OUTPUT: English only. Correct medical terminology errors."""
-
-
-def get_lecture_prompt_pro(lang: str = "fa") -> str:
-    """Advanced Academic Lecture prompt for 405B Pro Engine."""
-    prompts = {
-        "fa": """نقش: استاد برجسته دانشگاه با سابقه ۲۰ ساله تدریس و تألیف کتب مرجع دانشگاهی.
-
-وظیفه: تبدیل رونویسی صوت به یک فصل جامع کتاب مرجع دانشگاهی (در سطح کتاب‌های مرجع مانند هاریسون، گایتون، یا رابینز).
-
-═══════════════════════════════════════════════════════════════
-                      فصل درسی آکادمیک
-═══════════════════════════════════════════════════════════════
-
-📚 ساختار الزامی:
-
-**۱. مقدمه علمی (Introduction)**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- تعریف دقیق موضوع با ارجاع به مفاهیم پایه
-- اهمیت بالینی/علمی موضوع
-- اهداف یادگیری این فصل
-- پیش‌نیازهای مطالعه
-
-**۲. متن اصلی (Main Content)**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- تقسیم‌بندی منطقی با **عناوین درشت**
-- توضیح گام‌به‌گام مفاهیم از ساده به پیچیده
-- استفاده از مثال‌های بالینی/کاربردی
-- ارتباط بین مفاهیم مختلف
-
-**۳. نکات کلیدی (Clinical Pearls) 💎**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- نکات مهم برای به‌خاطر سپردن
-- اشتباهات رایج و نحوه اجتناب
-- نکات امتحانی (High-Yield Points)
-
-**۴. جداول آموزشی (Educational Tables) 📊**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-| عنوان | توضیح | مثال |
-|-------|-------|------|
-| | | |
-
-**۵. خلاصه فصل (Summary)**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- مرور نکات کلیدی
-- نقشه مفهومی (Concept Map)
-
-**۶. سؤالات مروری (Review Questions)**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- ۳-۵ سؤال برای خودآزمایی
-
-═══════════════════════════════════════════════════════════════
-
-📝 الزامات نگارشی:
-
-۱. **زبان:** فارسی رسمی و آکادمیک - از کلمات عامیانه استفاده نشود
-۲. **اصطلاحات تخصصی:** به فارسی با معادل انگلیسی در پرانتز
-   مثال: فشار خون (Blood Pressure)
-۳. **ساختار جملات:** روان، علمی، بدون پیچیدگی غیرضروری
-۴. **پاراگراف‌بندی:** هر پاراگراف یک ایده اصلی
-۵. **تأکید:** استفاده از **بولد** برای نکات مهم
-
-🎯 هدف نهایی: خواننده پس از مطالعه این فصل، نیازی به گوش دادن به صوت اصلی نداشته باشد و درک کاملی از موضوع پیدا کند.
-
-زبان خروجی: فقط فارسی آکادمیک""",
-
-        "en": """Role: Distinguished University Professor with 20+ years of teaching and textbook authoring experience.
-
-Task: Transform the audio transcription into a comprehensive Reference Textbook Chapter (similar to Harrison's, Guyton's, or Robbins' standards).
-
-STRUCTURE:
-
-## 1. Introduction
-- Scientific definition with foundational concepts
-- Clinical/scientific significance
-- Learning objectives
-- Prerequisites
-
-## 2. Main Content
-- Logical organization with **bold headers**
-- Step-by-step explanation from simple to complex
-- Clinical/practical examples
-- Concept interconnections
-
-## 3. Clinical Pearls 💎
-- Key points to remember
-- Common mistakes to avoid
-- High-yield examination points
-
-## 4. Educational Tables 📊
-| Topic | Description | Example |
-|-------|-------------|---------|
-
-## 5. Chapter Summary
-- Key points review
-- Concept map
-
-## 6. Review Questions
-- 3-5 self-assessment questions
-
-OUTPUT LANGUAGE: English only, formal academic tone.""",
-
-        "fr": """Rôle: Professeur d'université distingué.
-Tâche: Transformer la transcription en un chapitre de manuel académique complet en français.
-Structure: Introduction, Contenu principal avec en-têtes, Points clés, Tableaux, Résumé, Questions.
-LANGUE DE SORTIE: Français académique uniquement.""",
-
-        "es": """Rol: Profesor universitario distinguido.
-Tarea: Transformar la transcripción en un capítulo de libro de texto académico completo en español.
-Estructura: Introducción, Contenido principal con encabezados, Puntos clave, Tablas, Resumen, Preguntas.
-IDIOMA DE SALIDA: Español académico únicamente.""",
-
-        "de": """Rolle: Angesehener Universitätsprofessor.
-Aufgabe: Die Transkription in ein umfassendes akademisches Lehrbuchkapitel auf Deutsch umwandeln.
-Struktur: Einleitung, Hauptinhalt mit Überschriften, Kernpunkte, Tabellen, Zusammenfassung, Fragen.
-AUSGABESPRACHE: Nur akademisches Deutsch.""",
-
-        "ru": """Роль: Выдающийся профессор университета.
-Задача: Преобразовать транскрипцию в полноценную главу академического учебника на русском языке.
-Структура: Введение, Основное содержание с заголовками, Ключевые моменты, Таблицы, Резюме, Вопросы.
-ЯЗЫК ВЫВОДА: Только академический русский.""",
-
-        "ar": """الدور: أستاذ جامعي متميز.
-المهمة: تحويل النص المكتوب إلى فصل كتاب أكاديمي شامل باللغة العربية.
-الهيكل: مقدمة، محتوى رئيسي مع عناوين، نقاط رئيسية، جداول، ملخص، أسئلة.
-لغة الإخراج: العربية الأكاديمية فقط."""
-    }
-    return prompts.get(lang, prompts["en"])
-
-
-def get_lecture_prompt_fast(lang: str = "fa") -> str:
-    """Simplified Lecture prompt for Fast Engine."""
-    target = LANGUAGES.get(lang, LANGUAGES["fa"])
-    return f"""You are a university professor. Create a comprehensive lecture notes document.
-
-Include:
-1. Introduction
-2. Main content with bold headers
-3. Key points
-4. Summary
-
-OUTPUT LANGUAGE: {target.name_en} ({target.name_native}) only."""
-
-
-def get_summary_prompt(lang: str, engine: Engine) -> str:
-    """Summary prompt for specified language and engine."""
-    target = LANGUAGES.get(lang, LANGUAGES["fa"])
-    
-    if engine == Engine.PRO:
-        return f"""Role: Expert Content Analyst and Academic Summarizer.
-
-Task: Create a comprehensive, structured summary in {target.name_en} ({target.name_native}).
-
-FORMAT:
-
-📌 **نمای کلی / Executive Summary**
-[3-4 sentences capturing the essence]
-
-📋 **نکات کلیدی / Key Points**
-• [Point 1 - most important]
-• [Point 2]
-• [Point 3]
-• [Continue as needed...]
-
-💡 **جزئیات مهم / Critical Details**
-[Names, numbers, dates, specific information]
-
-📊 **ساختار محتوا / Content Structure**
-[How the original content was organized]
-
-🎯 **نتیجه‌گیری / Conclusions**
-[Main takeaways and implications]
-
-✅ **اقدامات پیشنهادی / Recommended Actions** (if applicable)
-[Any action items mentioned]
-
-OUTPUT LANGUAGE: {target.name_en.upper()} ({target.name_native}) ONLY"""
-    else:
-        return f"""Summarize this content in {target.name_en}.
-
-Include:
-• Overview (2-3 sentences)
-• Key points (bullet list)
-• Conclusion
-
-OUTPUT: {target.name_en} only."""
-
-
-def get_transcript_prompt(lang: str, engine: Engine) -> str:
-    """Transcript formatting prompt."""
-    target = LANGUAGES.get(lang, LANGUAGES["fa"])
-    
-    if engine == Engine.PRO:
-        return f"""Role: Professional Transcription Specialist.
-
-Task: Format and clean the raw transcription with expert precision.
 
 RULES:
-1. Fix transcription errors while preserving original meaning
-2. Add proper punctuation (. , ? ! : ; —)
-3. Create logical paragraph breaks
-4. Mark speakers as [Speaker 1], [Speaker 2] if multiple
-5. Preserve mixed-language content:
-   - Keep English words in Latin script within {target.name_en} text
-   - Example: "من یک meeting داشتم" stays as-is
-6. Mark unclear audio as [نامفهوم] or [unclear]
-7. Add timestamps for long content: [00:00]
-8. Preserve technical terms, names, and numbers exactly
+1. OUTPUT IN ENGLISH ONLY
+2. Correct medical terminology errors
+3. Include ICD-10 codes
+4. Mark missing info as "Not documented"
+
+OUTPUT LANGUAGE: ENGLISH ONLY"""
+
+
+def get_summary_prompt(detected_lang: str, detailed: bool = False) -> str:
+    """Summary prompt."""
+    lang = LANGUAGES.get(detected_lang, LANGUAGES["fa"])
+    
+    if detailed:
+        return f"""Role: Expert Content Analyst.
+
+Task: Create a comprehensive summary in {lang.name_en}.
 
 FORMAT:
-Clean, professional paragraphs with proper formatting.
 
-OUTPUT LANGUAGE: Preserve original language, format in {target.name_en}."""
+📌 **Executive Summary**
+[3-4 sentences]
+
+📋 **Key Points**
+• [Point 1]
+• [Point 2]
+• [Point 3]
+...
+
+💡 **Important Details**
+[Names, numbers, specifics]
+
+🎯 **Conclusions**
+[Main takeaways]
+
+✅ **Action Items** (if any)
+
+OUTPUT: {lang.name_en} only"""
     else:
-        return f"""Clean and format this transcription.
-- Fix errors, add punctuation
-- Create paragraphs
-- Mark unclear parts as [unclear]
-- Keep original language
-OUTPUT: Formatted text."""
+        return f"""Summarize this content in {lang.name_en}.
+
+Format:
+• Overview (2 sentences)
+• Key points (bullets)
+• Conclusion
+
+OUTPUT: {lang.name_en} only."""
 
 
-def get_lyrics_prompt(engine: Engine) -> str:
+def get_lyrics_prompt() -> str:
     """Lyrics extraction prompt."""
-    if engine == Engine.PRO:
-        return """Role: Professional Music Transcriptionist and Lyrics Analyst.
-
-Task: Extract and format lyrics OR speech transcription with expert precision.
+    return """Extract and format lyrics OR speech from this transcription.
 
 FOR MUSIC:
-🎵 **Song Information** (if identifiable)
+🎵 **Song Info** (if identifiable)
 - Title:
 - Artist:
-- Album:
-- Genre:
-- Language:
-
----
-
-[Intro] (if applicable)
 
 [Verse 1]
-Line 1
-Line 2
-...
-
-[Pre-Chorus]
-...
+Lines...
 
 [Chorus]
-...
+Lines...
 
 [Verse 2]
 ...
 
-[Bridge]
-...
-
-[Outro]
-...
-
----
-
-📝 **Notes:**
-- Describe the mood/tone
-- Note any background vocals
-- Identify instruments if notable
-
 FOR SPEECH:
-Format as clean paragraphs with speaker identification.
+Clean paragraphs with speaker identification.
 
 RULES:
-1. Keep ORIGINAL language - never translate
-2. Mark instrumental: [🎸 Guitar Solo], [🎹 Piano], [🥁 Drums]
-3. Mark unclear lyrics: [...]
-4. Note harmonies: (harmony) or [Background: ...]
-5. Include ad-libs in parentheses
+1. Keep ORIGINAL language
+2. Mark unclear: [...]
+3. Mark instrumental: [🎸 Instrumental]
 
-OUTPUT: Original language, professionally formatted."""
-    else:
-        return """Extract lyrics or transcribe speech.
-
-Format:
-[Verse 1]
-Lines...
-
-[Chorus]
-Lines...
-
-Keep original language. Mark unclear parts as [...].
-OUTPUT: Formatted lyrics/transcription."""
+OUTPUT: Original language, formatted."""
 
 
-def get_translation_prompt(source_lang: str, target_lang: str, engine: Engine) -> str:
-    """Translation prompt between languages."""
+def get_translation_prompt(source_lang: str, target_lang: str, detailed: bool = False) -> str:
+    """Translation prompt."""
     source = LANGUAGES.get(source_lang, LANGUAGES["en"])
     target = LANGUAGES.get(target_lang, LANGUAGES["fa"])
     
-    if engine == Engine.PRO:
-        return f"""Role: Expert Translator with native fluency in both {source.name_en} and {target.name_en}.
+    if detailed:
+        return f"""Role: Expert Translator fluent in {source.name_en} and {target.name_en}.
 
-Task: Translate the content from {source.name_en} to {target.name_en} with professional quality.
+Task: Translate from {source.name_en} to {target.name_en}.
 
-TRANSLATION PRINCIPLES:
-
-1. **Semantic Accuracy:** Preserve complete meaning
-2. **Natural Fluency:** Use idiomatic {target.name_en}
-3. **Tone Preservation:** Maintain speaker's style
-4. **Cultural Adaptation:** Adapt cultural references appropriately
-5. **Technical Precision:** Keep specialized terms accurate
-
-SPECIAL HANDLING:
-- **Proper nouns:** Keep original or use standard transliteration
-- **Idioms:** Use equivalent expressions, not literal translation
-- **Numbers/Dates:** Convert to target locale if appropriate
-- **Quotes:** Preserve with appropriate quotation marks
-- **Technical terms:** Translate with original in parentheses
+PRINCIPLES:
+1. Preserve complete meaning
+2. Use natural, idiomatic {target.name_en}
+3. Maintain tone and style
+4. Keep proper nouns
+5. Translate idioms to equivalents
 
 OUTPUT FORMAT:
 
-📝 **{target.name_native} Translation:**
-
-[Full translated text]
+📝 **Translation:**
+[Full translation]
 
 ---
 
-📌 **خلاصه / Summary:**
-[2-3 sentence summary of content]
+📌 **Summary:**
+[2 sentences about content]
 
-🔤 **کلمات کلیدی / Keywords:**
-[Key terms from the text]
-
-OUTPUT LANGUAGE: {target.name_en.upper()} ({target.name_native}) ONLY"""
+OUTPUT: {target.name_en} only"""
     else:
         return f"""Translate from {source.name_en} to {target.name_en}.
-
-Maintain:
-- Original meaning
-- Natural expression
-- Proper nouns
-
-OUTPUT: {target.name_en} translation only."""
+Keep meaning, use natural language.
+OUTPUT: {target.name_en} only."""
 
 
 # ============== UI MESSAGES ==============
 MESSAGES = {
     "welcome": """🎧 **به Omni-Hear AI خوش آمدید!**
 
-🚀 **نسخه 6.0 - موتور دوگانه**
+🚀 **نسخه 7.0 - AssemblyAI + Groq**
 
-**⚡ حالت سریع:** پاسخ در ۳ ثانیه (Llama 70B)
-**🚀 حالت دقیق:** حداکثر کیفیت (Llama 405B)
+**🎤 موتور رونویسی:** AssemblyAI (دقت بالا)
+**⚡ پردازش سریع:** Llama 8B
+**🧠 پردازش پیشرفته:** Llama 70B
 
-📤 **یک فایل صوتی یا ویس ارسال کنید**
+📤 **یک فایل صوتی ارسال کنید**
+
+🔄 **قابلیت جدید:** پردازش چندباره روی یک فایل!
 
 🌐 **زبان‌ها:**
 🇮🇷 فارسی | 🇬🇧 English | 🇫🇷 Français
@@ -672,63 +458,77 @@ MESSAGES = {
 
     "audio_received": """🎵 **فایل دریافت شد!** ({size})
 
-⚡ **سریع** = پاسخ سریع (~۳ ثانیه)
-🚀 **دقیق** = کیفیت حرفه‌ای (405B)
+⚡ **سریع** = پاسخ فوری (8B)
+🧠 **پیشرفته** = کیفیت بالا (70B)
+
+🔄 می‌توانید چند عملیات روی همین فایل انجام دهید!
 
 📋 نوع پردازش را انتخاب کنید:""",
 
+    "processing_stt": "🎤 **مرحله ۱/۲:** رونویسی با AssemblyAI...\n\n⏳ پیشرفت: {progress}%",
+    "processing_llm_fast": "🧠 **مرحله ۲/۲:** پردازش سریع با Llama 8B...\n\n⏳ پیشرفت: {progress}%",
+    "processing_llm_complex": "🧠 **مرحله ۲/۲:** پردازش پیشرفته با Llama 70B...\n\n⏳ پیشرفت: {progress}%",
+    
+    "operation_complete": "✅ **عملیات {mode} کامل شد!**\n\n🔄 می‌توانید عملیات دیگری روی همین فایل انجام دهید.",
+    
     "select_language": "🌍 **زبان خروجی را انتخاب کنید:**",
     "select_source_lang": "🗣 **زبان صوت (مبدا):**",
     "select_target_lang": "🎯 **زبان ترجمه (مقصد):**",
     
-    "processing_stt": "🎤 **مرحله ۱/۲:** تبدیل صدا به متن...",
-    "processing_fast": "⚡ **مرحله ۲/۲:** پردازش سریع با Llama 70B...",
-    "processing_pro": "🚀 **مرحله ۲/۲:** پردازش حرفه‌ای با Llama 405B...",
-    "fallback_notice": "⚠️ سرویس 405B در دسترس نیست. استفاده از حالت سریع...",
+    "detected_language": "🔍 **زبان تشخیص داده شده:** {lang}",
     
     "error": "❌ خطا در پردازش. لطفاً دوباره تلاش کنید.",
+    "error_detail": "❌ خطا: {detail}",
     "no_audio": "⚠️ لطفاً ابتدا یک فایل صوتی ارسال کنید.",
-    "file_too_large": "⚠️ حجم فایل بیشتر از ۲۵ مگابایت است.",
+    "file_too_large": "⚠️ حجم فایل بیشتر از ۲۰ مگابایت است.",
     "not_audio": "⚠️ لطفاً فایل صوتی ارسال کنید (MP3, OGG, WAV, M4A).",
     "api_missing": "⚠️ کلید API تنظیم نشده: {missing}",
-    "pro_unavailable": "⚠️ حالت Pro در دسترس نیست. از حالت سریع استفاده شد.",
+    "session_expired": "⚠️ فایل صوتی منقضی شده. لطفاً دوباره ارسال کنید.",
 }
 
 
 # ============== KEYBOARDS ==============
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Main menu with dual buttons for each feature."""
+    """Main menu with dual options."""
     return InlineKeyboardMarkup([
         # Transcript
         [
             InlineKeyboardButton("📜 رونویسی ⚡", callback_data="mode:transcript:fast"),
-            InlineKeyboardButton("📜 رونویسی 🚀", callback_data="mode:transcript:pro"),
         ],
         # Lecture
         [
-            InlineKeyboardButton("📚 درسنامه ⚡", callback_data="mode:lecture:fast"),
-            InlineKeyboardButton("📚 درسنامه 🚀", callback_data="mode:lecture:pro"),
+            InlineKeyboardButton("📚 درسنامه 🧠", callback_data="mode:lecture:complex"),
         ],
         # Medical SOAP
         [
-            InlineKeyboardButton("🩺 پزشکی ⚡", callback_data="mode:soap:fast"),
-            InlineKeyboardButton("🩺 پزشکی 🚀", callback_data="mode:soap:pro"),
+            InlineKeyboardButton("🩺 SOAP پزشکی 🧠", callback_data="mode:soap:complex"),
         ],
         # Summary
         [
-            InlineKeyboardButton("📝 خلاصه ⚡", callback_data="mode:summary:fast"),
-            InlineKeyboardButton("📝 خلاصه 🚀", callback_data="mode:summary:pro"),
+            InlineKeyboardButton("📝 خلاصه ⚡", callback_data="mode:summary_quick:fast"),
+            InlineKeyboardButton("📝 خلاصه جامع 🧠", callback_data="mode:summary_detailed:complex"),
         ],
         # Lyrics
         [
             InlineKeyboardButton("🎵 متن آهنگ ⚡", callback_data="mode:lyrics:fast"),
-            InlineKeyboardButton("🎵 متن آهنگ 🚀", callback_data="mode:lyrics:pro"),
         ],
         # Translation
         [
-            InlineKeyboardButton("🌍 ترجمه ⚡", callback_data="mode:translate:fast"),
-            InlineKeyboardButton("🌍 ترجمه 🚀", callback_data="mode:translate:pro"),
+            InlineKeyboardButton("🌍 ترجمه ⚡", callback_data="mode:translate_quick:fast"),
+            InlineKeyboardButton("🌍 ترجمه دقیق 🧠", callback_data="mode:translate_detailed:complex"),
         ],
+        # Clear session
+        [
+            InlineKeyboardButton("🗑 پاک کردن فایل", callback_data="clear:session"),
+        ],
+    ])
+
+
+def get_back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    """Back to menu button after operation."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="back:main")],
+        [InlineKeyboardButton("🗑 پاک کردن و خروج", callback_data="clear:session")],
     ])
 
 
@@ -819,103 +619,104 @@ async def convert_audio_to_mp3(audio_data: bytes, original_format: str = "ogg") 
         return None, str(e)
 
 
-# ============== GROQ WHISPER STT ==============
-async def transcribe_with_whisper(audio_data: bytes) -> Tuple[Optional[str], Optional[str]]:
-    """Transcribe with Groq Whisper including context prompt."""
-    if not groq_client:
-        return None, "Groq client not initialized"
+# ============== ASSEMBLYAI STT ==============
+async def transcribe_with_assemblyai(
+    audio_data: bytes,
+    progress_callback=None
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Transcribe with AssemblyAI using async polling.
+    Returns: (transcription, detected_language, error)
+    """
+    if not ASSEMBLYAI_API_KEY:
+        return None, None, "AssemblyAI not configured"
     
     try:
-        def _transcribe():
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                f.write(audio_data)
-                temp_path = f.name
+        # Save audio to temp file
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(audio_data)
+            temp_path = f.name
+        
+        try:
+            # Configure transcriber with language detection
+            config = aai.TranscriptionConfig(
+                language_detection=True,  # Auto-detect language
+                punctuate=True,
+                format_text=True,
+            )
             
-            try:
-                with open(temp_path, "rb") as audio_file:
-                    result = groq_client.audio.transcriptions.create(
-                        model=WHISPER_MODEL,
-                        file=audio_file,
-                        response_format="text",
-                        language=None,  # Auto-detect
-                        temperature=0.0,
-                        prompt=WHISPER_CONTEXT_PROMPT,  # Context for better accuracy
-                    )
-                return result, None
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-        
-        result, error = await asyncio.to_thread(_transcribe)
-        
-        if error:
-            return None, error
-        
-        if result and len(result.strip()) > 0:
-            logger.info(f"✅ Whisper: {len(result)} chars")
-            return result.strip(), None
-        
-        return None, "Empty transcription"
+            transcriber = aai.Transcriber()
+            
+            # Submit for transcription (async polling internally)
+            if progress_callback:
+                await progress_callback(10)
+            
+            def _transcribe():
+                return transcriber.transcribe(temp_path, config=config)
+            
+            # Poll with progress updates
+            if progress_callback:
+                await progress_callback(20)
+            
+            transcript = await asyncio.to_thread(_transcribe)
+            
+            if progress_callback:
+                await progress_callback(80)
+            
+            if transcript.status == aai.TranscriptStatus.error:
+                return None, None, f"AssemblyAI error: {transcript.error}"
+            
+            if transcript.status == aai.TranscriptStatus.completed:
+                text = transcript.text
+                
+                # Get detected language
+                detected_lang = "en"  # Default
+                if hasattr(transcript, 'language_code') and transcript.language_code:
+                    detected_lang = AAI_LANG_MAP.get(transcript.language_code, "en")
+                
+                if progress_callback:
+                    await progress_callback(100)
+                
+                logger.info(f"✅ AssemblyAI: {len(text)} chars, lang={detected_lang}")
+                return text, detected_lang, None
+            
+            return None, None, f"Unexpected status: {transcript.status}"
+            
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
     
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Whisper error: {error_msg}")
-        if "rate_limit" in error_msg.lower():
-            return None, "rate_limit"
-        return None, error_msg[:100]
+        logger.error(f"AssemblyAI error: {e}")
+        return None, None, str(e)[:100]
 
 
-# ============== GROQ LLM (FAST) ==============
-async def process_with_groq(text: str, system_prompt: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Process with Groq LLM (Fast mode)."""
+# ============== GROQ LLM ==============
+async def process_with_groq(
+    text: str,
+    system_prompt: str,
+    complexity: TaskComplexity,
+    progress_callback=None
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Process with Groq LLM based on complexity."""
     if not groq_client:
-        return None, None, "Groq client not initialized"
+        return None, None, "Groq not configured"
     
-    models = [GROQ_LLM_PRIMARY, GROQ_LLM_FALLBACK]
+    # Select model based on complexity
+    if complexity == TaskComplexity.FAST:
+        models = [GROQ_MODEL_FAST, GROQ_MODEL_COMPLEX]
+    else:
+        models = [GROQ_MODEL_COMPLEX, GROQ_MODEL_FAST]
     
     for model in models:
         try:
-            logger.info(f"⚡ Groq: {model}")
+            logger.info(f"🧠 Groq: {model}")
+            
+            if progress_callback:
+                await progress_callback(30)
             
             def _generate():
                 return groq_client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Process:\n\n{text}"}
-                    ],
-                    temperature=0.7,
-                    max_tokens=8000,
-                )
-            
-            response = await asyncio.to_thread(_generate)
-            
-            if response.choices and response.choices[0].message.content:
-                result = response.choices[0].message.content.strip()
-                logger.info(f"✅ Groq success: {len(result)} chars")
-                return result, f"⚡ {model}", None
-        
-        except Exception as e:
-            logger.warning(f"❌ Groq {model}: {str(e)[:50]}")
-            continue
-    
-    return None, None, "All Groq models failed"
-
-
-# ============== SAMBANOVA LLM (PRO) ==============
-async def process_with_sambanova(text: str, system_prompt: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Process with SambaNova LLM (Pro mode)."""
-    if not sambanova_client:
-        return None, None, "SambaNova not available"
-    
-    models = [SAMBANOVA_MODEL_PRO, SAMBANOVA_MODEL_FALLBACK]
-    
-    for model in models:
-        try:
-            logger.info(f"🚀 SambaNova: {model}")
-            
-            def _generate():
-                return sambanova_client.chat.completions.create(
                     model=model,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -925,46 +726,29 @@ async def process_with_sambanova(text: str, system_prompt: str) -> Tuple[Optiona
                     max_tokens=8000,
                 )
             
+            if progress_callback:
+                await progress_callback(60)
+            
             response = await asyncio.to_thread(_generate)
+            
+            if progress_callback:
+                await progress_callback(90)
             
             if response.choices and response.choices[0].message.content:
                 result = response.choices[0].message.content.strip()
-                logger.info(f"✅ SambaNova success: {len(result)} chars")
-                return result, f"🚀 {model}", None
+                
+                if progress_callback:
+                    await progress_callback(100)
+                
+                model_label = "⚡ 8B" if model == GROQ_MODEL_FAST else "🧠 70B"
+                logger.info(f"✅ Groq success: {len(result)} chars")
+                return result, f"{model_label} ({model})", None
         
         except Exception as e:
-            logger.warning(f"❌ SambaNova {model}: {str(e)[:50]}")
+            logger.warning(f"❌ Groq {model}: {str(e)[:50]}")
             continue
     
-    return None, None, "SambaNova failed"
-
-
-# ============== UNIFIED PROCESSOR ==============
-async def process_with_llm(
-    text: str,
-    system_prompt: str,
-    engine: Engine
-) -> Tuple[Optional[str], Optional[str], Optional[str], bool]:
-    """
-    Process with appropriate engine.
-    Returns: (result, model_name, error, used_fallback)
-    """
-    used_fallback = False
-    
-    if engine == Engine.PRO:
-        # Try SambaNova first
-        if sambanova_client:
-            result, model, error = await process_with_sambanova(text, system_prompt)
-            if result:
-                return result, model, None, False
-            logger.warning("SambaNova failed, falling back to Groq")
-        
-        # Fallback to Groq
-        used_fallback = True
-    
-    # Use Groq (Fast mode or fallback)
-    result, model, error = await process_with_groq(text, system_prompt)
-    return result, model, error, used_fallback
+    return None, None, "All Groq models failed"
 
 
 # ============== FULL PIPELINE ==============
@@ -972,18 +756,18 @@ async def process_audio_complete(
     audio_data: bytes,
     mime_type: str,
     mode: str,
-    engine: Engine,
-    lang: str = "fa",
-    source_lang: Optional[str] = None,
+    complexity: TaskComplexity,
     target_lang: Optional[str] = None,
+    source_lang: Optional[str] = None,
+    progress_callback=None,
 ) -> Dict:
     """Complete audio processing pipeline."""
     result = {
         "text": None,
         "transcription": None,
+        "detected_lang": None,
         "model": None,
         "error": None,
-        "used_fallback": False,
     }
     
     # Format detection
@@ -1003,14 +787,17 @@ async def process_audio_complete(
     else:
         mp3_data = audio_data
     
-    # Step 1: Transcribe with Whisper
-    transcription, stt_error = await transcribe_with_whisper(mp3_data)
+    # Step 1: Transcribe with AssemblyAI
+    async def stt_progress(p):
+        if progress_callback:
+            await progress_callback("stt", p)
+    
+    transcription, detected_lang, stt_error = await transcribe_with_assemblyai(
+        mp3_data, stt_progress
+    )
     
     if stt_error:
-        if stt_error == "rate_limit":
-            result["error"] = "⚠️ محدودیت Whisper. چند دقیقه صبر کنید."
-        else:
-            result["error"] = f"❌ خطا در STT: {stt_error}"
+        result["error"] = f"❌ خطای AssemblyAI: {stt_error}"
         return result
     
     if not transcription:
@@ -1018,32 +805,42 @@ async def process_audio_complete(
         return result
     
     result["transcription"] = transcription
+    result["detected_lang"] = detected_lang
     
-    # Step 2: Get appropriate prompt and process
+    # Step 2: Get appropriate prompt
     if mode == "transcript":
-        prompt = get_transcript_prompt(lang, engine)
+        prompt = get_transcript_prompt(detected_lang)
     elif mode == "lecture":
-        prompt = get_lecture_prompt_pro(lang) if engine == Engine.PRO else get_lecture_prompt_fast(lang)
+        prompt = get_lecture_prompt(detected_lang)
     elif mode == "soap":
-        prompt = get_soap_prompt_pro() if engine == Engine.PRO else get_soap_prompt_fast()
-    elif mode == "summary":
-        prompt = get_summary_prompt(lang, engine)
+        prompt = get_soap_prompt()
+    elif mode in ["summary_quick", "summary_detailed"]:
+        detailed = mode == "summary_detailed"
+        prompt = get_summary_prompt(detected_lang, detailed)
     elif mode == "lyrics":
-        prompt = get_lyrics_prompt(engine)
-    elif mode == "translate":
-        if not source_lang or not target_lang:
-            result["error"] = "❌ زبان مشخص نشده"
+        prompt = get_lyrics_prompt()
+    elif mode in ["translate_quick", "translate_detailed"]:
+        if not source_lang:
+            source_lang = detected_lang
+        if not target_lang:
+            result["error"] = "❌ زبان مقصد مشخص نشده"
             return result
-        prompt = get_translation_prompt(source_lang, target_lang, engine)
+        detailed = mode == "translate_detailed"
+        prompt = get_translation_prompt(source_lang, target_lang, detailed)
     else:
-        prompt = get_transcript_prompt(lang, engine)
+        prompt = get_transcript_prompt(detected_lang)
     
-    # Process with LLM
-    text, model, llm_error, used_fallback = await process_with_llm(transcription, prompt, engine)
+    # Step 3: Process with Groq
+    async def llm_progress(p):
+        if progress_callback:
+            await progress_callback("llm", p)
+    
+    text, model, llm_error = await process_with_groq(
+        transcription, prompt, complexity, llm_progress
+    )
     
     result["text"] = text
     result["model"] = model
-    result["used_fallback"] = used_fallback
     
     if llm_error and not text:
         result["error"] = f"❌ {llm_error}"
@@ -1053,32 +850,32 @@ async def process_audio_complete(
 
 # ============== TELEGRAM HANDLERS ==============
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    clear_user_cache(user_id)
     await update.message.reply_text(MESSAGES["welcome"], parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    help_text = """📖 **راهنمای Omni-Hear AI v6.0**
+    help_text = """📖 **راهنمای Omni-Hear AI v7.0**
 
 **🔹 نحوه استفاده:**
 1️⃣ فایل صوتی ارسال کنید
-2️⃣ حالت پردازش را انتخاب کنید:
-   • ⚡ سریع = پاسخ فوری
-   • 🚀 دقیق = کیفیت حرفه‌ای
-
-**🔹 قابلیت‌ها:**
-• 📜 رونویسی - متن کامل صوت
-• 📚 درسنامه - فصل کتاب درسی
-• 🩺 پزشکی - SOAP Note استاندارد
-• 📝 خلاصه - خلاصه هوشمند
-• 🎵 متن آهنگ - لیریک
-• 🌍 ترجمه - ۷ زبان
+2️⃣ نوع پردازش را انتخاب کنید
+3️⃣ می‌توانید چند عملیات روی همین فایل انجام دهید!
 
 **🔹 موتورها:**
-• ⚡ Groq Llama 70B (~۳ ثانیه)
-• 🚀 SambaNova Llama 405B (حرفه‌ای)
+• ⚡ **سریع (8B):** رونویسی، لیریک، ترجمه سریع
+• 🧠 **پیشرفته (70B):** درسنامه، SOAP، خلاصه جامع
+
+**🔹 قابلیت‌ها:**
+📜 رونویسی | 📚 درسنامه | 🩺 SOAP
+📝 خلاصه | 🎵 لیریک | 🌍 ترجمه
+
+**🔹 ویژگی جدید:**
+🔄 پردازش چندباره روی یک فایل!
 
 **🔹 دستورات:**
-/start - شروع
+/start - شروع مجدد
 /help - راهنما
 /status - وضعیت"""
     
@@ -1086,22 +883,31 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    status = ["🔍 **وضعیت سیستم**\n"]
+    user_id = update.effective_user.id
+    has_audio = user_id in user_audio_cache
+    
+    status = ["🔍 **وضعیت سیستم v7.0**\n"]
+    
+    if ASSEMBLYAI_API_KEY:
+        status.append("✅ **AssemblyAI (STT):** فعال")
+    else:
+        status.append("❌ **AssemblyAI:** غیرفعال")
     
     if groq_client:
-        status.append("✅ **Groq (STT + Fast):** فعال")
+        status.append("✅ **Groq (LLM):** فعال")
     else:
         status.append("❌ **Groq:** غیرفعال")
     
-    if sambanova_client:
-        status.append("✅ **SambaNova (Pro 405B):** فعال")
-    else:
-        status.append("⚠️ **SambaNova:** غیرفعال")
-    
     status.append(f"\n**🤖 مدل‌ها:**")
-    status.append(f"• STT: `{WHISPER_MODEL}`")
-    status.append(f"• Fast: `{GROQ_LLM_PRIMARY}`")
-    status.append(f"• Pro: `{SAMBANOVA_MODEL_PRO}`")
+    status.append(f"• Fast: `{GROQ_MODEL_FAST}`")
+    status.append(f"• Complex: `{GROQ_MODEL_COMPLEX}`")
+    
+    status.append(f"\n**📁 وضعیت فایل شما:**")
+    if has_audio:
+        size = user_audio_cache[user_id].get("size", 0) / 1024
+        status.append(f"✅ فایل موجود ({size:.1f} KB)")
+    else:
+        status.append("❌ فایلی ندارید")
     
     flags = " ".join([l.flag for l in LANGUAGES.values()])
     status.append(f"\n**🌍 زبان‌ها:** {flags}")
@@ -1114,8 +920,15 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     msg = update.message
     
-    if not groq_client:
-        await msg.reply_text(MESSAGES["api_missing"].format(missing="GROQ_API_KEY"))
+    # Check APIs
+    missing = []
+    if not ASSEMBLYAI_API_KEY:
+        missing.append("ASSEMBLYAI_API_KEY")
+    if not GROQ_API_KEY:
+        missing.append("GROQ_API_KEY")
+    
+    if missing:
+        await msg.reply_text(MESSAGES["api_missing"].format(missing=", ".join(missing)))
         return
     
     # Get audio
@@ -1142,17 +955,21 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         
         mime_type = "audio/ogg" if msg.voice else getattr(audio_file, 'mime_type', 'audio/mpeg')
         
+        # Store in persistent cache
         user_audio_cache[user_id] = {
             "data": bytes(audio_bytes),
             "mime_type": mime_type,
             "size": len(audio_bytes),
+            "timestamp": time.time(),
         }
         
-        # Clear state
+        # Clear old state
         user_state.pop(user_id, None)
         
         size_kb = len(audio_bytes) / 1024
         size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
+        
+        logger.info(f"✅ Audio cached: user={user_id}, size={len(audio_bytes)}")
         
         await msg.reply_text(
             MESSAGES["audio_received"].format(size=size_str),
@@ -1175,7 +992,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     parts = data.split(":")
     action = parts[0]
     
-    # Back button
+    # Clear session
+    if action == "clear":
+        clear_user_cache(user_id)
+        await query.edit_message_text(
+            "🗑 **فایل پاک شد.**\n\n📤 برای شروع مجدد، یک فایل صوتی ارسال کنید.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Back to main menu
     if action == "back":
         if user_id in user_audio_cache:
             size_kb = user_audio_cache[user_id]["size"] / 1024
@@ -1186,77 +1012,51 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 parse_mode="Markdown"
             )
         else:
-            await query.edit_message_text(MESSAGES["no_audio"])
+            await query.edit_message_text(MESSAGES["session_expired"])
         user_state.pop(user_id, None)
         return
     
-    # Mode selection: mode:type:engine
+    # Mode selection: mode:type:complexity
     if action == "mode":
         mode = parts[1]
-        engine_str = parts[2]
-        engine = Engine.PRO if engine_str == "pro" else Engine.FAST
+        complexity_str = parts[2]
+        complexity = TaskComplexity.COMPLEX if complexity_str == "complex" else TaskComplexity.FAST
         
         if user_id not in user_audio_cache:
-            await query.edit_message_text(MESSAGES["no_audio"])
+            await query.edit_message_text(MESSAGES["session_expired"])
             return
         
-        # Store engine preference
-        user_state[user_id] = {"engine": engine}
+        # Store state
+        user_state[user_id] = {
+            "mode": mode,
+            "complexity": complexity,
+        }
         
-        # Modes needing language selection
-        if mode in ["transcript", "lecture", "summary"]:
-            user_state[user_id]["mode"] = mode
+        # Translation needs target language selection
+        if mode in ["translate_quick", "translate_detailed"]:
             await query.edit_message_text(
-                MESSAGES["select_language"],
-                reply_markup=get_language_keyboard(f"lang:{mode}:{engine_str}"),
+                MESSAGES["select_target_lang"],
+                reply_markup=get_language_keyboard(f"target:{complexity_str}"),
                 parse_mode="Markdown"
             )
             return
         
-        # Translation needs source + target
-        if mode == "translate":
-            user_state[user_id]["mode"] = mode
-            await query.edit_message_text(
-                MESSAGES["select_source_lang"],
-                reply_markup=get_language_keyboard(f"source:{engine_str}"),
-                parse_mode="Markdown"
-            )
-            return
-        
-        # SOAP and Lyrics - process directly
-        await process_and_respond(query, context, user_id, mode, engine)
+        # Process directly for other modes
+        await process_and_respond(query, context, user_id, mode, complexity)
         return
     
-    # Language selection: lang:mode:engine:code
-    if action == "lang":
-        mode = parts[1]
-        engine_str = parts[2]
-        lang = parts[3]
-        engine = Engine.PRO if engine_str == "pro" else Engine.FAST
-        await process_and_respond(query, context, user_id, mode, engine, lang=lang)
-        return
-    
-    # Source language: source:engine:code
-    if action == "source":
-        engine_str = parts[1]
-        source_lang = parts[2]
-        user_state[user_id]["source_lang"] = source_lang
-        await query.edit_message_text(
-            MESSAGES["select_target_lang"],
-            reply_markup=get_target_language_keyboard(source_lang, f"target:{engine_str}"),
-            parse_mode="Markdown"
-        )
-        return
-    
-    # Target language: target:engine:code
+    # Target language for translation: target:complexity:code
     if action == "target":
-        engine_str = parts[1]
+        complexity_str = parts[1]
         target_lang = parts[2]
-        engine = Engine.PRO if engine_str == "pro" else Engine.FAST
-        source_lang = user_state.get(user_id, {}).get("source_lang", "en")
+        complexity = TaskComplexity.COMPLEX if complexity_str == "complex" else TaskComplexity.FAST
+        
+        state = user_state.get(user_id, {})
+        mode = state.get("mode", "translate_quick")
+        
         await process_and_respond(
-            query, context, user_id, "translate", engine,
-            source_lang=source_lang, target_lang=target_lang
+            query, context, user_id, mode, complexity,
+            target_lang=target_lang
         )
         return
 
@@ -1266,15 +1066,13 @@ async def process_and_respond(
     context,
     user_id: int,
     mode: str,
-    engine: Engine,
-    lang: str = "fa",
-    source_lang: Optional[str] = None,
+    complexity: TaskComplexity,
     target_lang: Optional[str] = None,
 ) -> None:
-    """Process and send response."""
+    """Process and send response with progress updates."""
     
     if user_id not in user_audio_cache:
-        await query.edit_message_text(MESSAGES["no_audio"])
+        await query.edit_message_text(MESSAGES["session_expired"])
         return
     
     audio_info = user_audio_cache[user_id]
@@ -1283,29 +1081,49 @@ async def process_and_respond(
         "transcript": "📜 رونویسی",
         "lecture": "📚 درسنامه",
         "soap": "🩺 SOAP پزشکی",
-        "summary": "📝 خلاصه",
+        "summary_quick": "📝 خلاصه سریع",
+        "summary_detailed": "📝 خلاصه جامع",
         "lyrics": "🎵 متن آهنگ",
-        "translate": "🌍 ترجمه",
+        "translate_quick": "🌍 ترجمه سریع",
+        "translate_detailed": "🌍 ترجمه دقیق",
     }
     
-    engine_name = "🚀 Pro (405B)" if engine == Engine.PRO else "⚡ Fast (70B)"
+    current_stage = "stt"
+    
+    async def update_progress(stage: str, progress: int):
+        nonlocal current_stage
+        current_stage = stage
+        
+        if stage == "stt":
+            msg = MESSAGES["processing_stt"].format(progress=progress)
+        elif stage == "llm":
+            if complexity == TaskComplexity.FAST:
+                msg = MESSAGES["processing_llm_fast"].format(progress=progress)
+            else:
+                msg = MESSAGES["processing_llm_complex"].format(progress=progress)
+        else:
+            return
+        
+        try:
+            await query.edit_message_text(
+                f"🎯 **{mode_names.get(mode)}**\n\n{msg}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass  # Ignore rate limit errors
     
     try:
-        # Show STT progress
-        await query.edit_message_text(
-            f"🎯 **{mode_names.get(mode)}** | {engine_name}\n\n{MESSAGES['processing_stt']}",
-            parse_mode="Markdown"
-        )
+        # Initial progress
+        await update_progress("stt", 0)
         
         # Process
         result = await process_audio_complete(
             audio_info["data"],
             audio_info["mime_type"],
             mode,
-            engine,
-            lang=lang,
-            source_lang=source_lang,
+            complexity,
             target_lang=target_lang,
+            progress_callback=update_progress,
         )
         
         if result["error"]:
@@ -1317,25 +1135,29 @@ async def process_and_respond(
             return
         
         # Build response
-        header = f"✅ **{mode_names.get(mode)}**\n"
+        detected_lang = result.get("detected_lang", "en")
+        lang_info = LANGUAGES.get(detected_lang, LANGUAGES["en"])
         
-        if mode == "translate" and source_lang and target_lang:
-            src = LANGUAGES.get(source_lang)
-            tgt = LANGUAGES.get(target_lang)
-            header += f"{src.flag} → {tgt.flag}\n"
+        header = f"✅ **{mode_names.get(mode)}**\n"
+        header += f"🔍 زبان تشخیص داده شده: {lang_info.flag} {lang_info.name_native}\n"
+        
+        if target_lang:
+            target = LANGUAGES.get(target_lang)
+            header += f"🎯 ترجمه به: {target.flag} {target.name_native}\n"
         
         header += "\n"
         
-        # Footer with model info
-        footer = f"\n\n---\n🤖 `{result['model']}`"
-        if result["used_fallback"]:
-            footer += f"\n⚠️ {MESSAGES['pro_unavailable']}"
+        # Footer
+        footer = f"\n\n---\n🤖 مدل: `{result['model']}`"
         
         full_text = header + result["text"] + footer
         
-        # Send (handle long messages)
+        # Send main response
         if len(full_text) > 4000:
+            # First chunk
             await query.edit_message_text(full_text[:4000], parse_mode="Markdown")
+            
+            # Remaining chunks
             remaining = full_text[4000:]
             while remaining:
                 chunk = remaining[:4000]
@@ -1346,11 +1168,24 @@ async def process_and_respond(
                     text=chunk,
                     parse_mode="Markdown"
                 )
+            
+            # Send back button separately
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=MESSAGES["operation_complete"].format(mode=mode_names.get(mode)),
+                reply_markup=get_back_to_menu_keyboard(),
+                parse_mode="Markdown"
+            )
         else:
-            try:
-                await query.edit_message_text(full_text, parse_mode="Markdown")
-            except:
-                await query.edit_message_text(full_text)
+            await query.edit_message_text(full_text, parse_mode="Markdown")
+            
+            # Send back button
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=MESSAGES["operation_complete"].format(mode=mode_names.get(mode)),
+                reply_markup=get_back_to_menu_keyboard(),
+                parse_mode="Markdown"
+            )
     
     except Exception as e:
         logger.error(f"Process error: {e}")
@@ -1358,23 +1193,28 @@ async def process_and_respond(
         await query.edit_message_text(f"❌ خطا: {str(e)[:100]}")
     
     finally:
-        user_audio_cache.pop(user_id, None)
+        # Clear state but KEEP audio cache!
         user_state.pop(user_id, None)
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Error: {context.error}")
+    logger.error(traceback.format_exc())
 
 
 # ============== MAIN ==============
 def main() -> None:
     print("\n" + "=" * 70)
-    print("  🎧 OMNI-HEAR AI v6.0 - DUAL-ENGINE EDITION")
-    print("  ⚡ Fast (Groq 70B) | 🚀 Pro (SambaNova 405B)")
+    print("  🎧 OMNI-HEAR AI v7.0 - AssemblyAI + Groq Edition")
+    print("  🎤 AssemblyAI STT | ⚡ Llama 8B | 🧠 Llama 70B")
     print("=" * 70)
     
     if not TELEGRAM_BOT_TOKEN:
         print("❌ TELEGRAM_BOT_TOKEN not set!")
+        sys.exit(1)
+    
+    if not ASSEMBLYAI_API_KEY:
+        print("❌ ASSEMBLYAI_API_KEY not set!")
         sys.exit(1)
     
     if not GROQ_API_KEY:
@@ -1382,8 +1222,11 @@ def main() -> None:
         sys.exit(1)
     
     print(f"✅ Telegram: Ready")
-    print(f"✅ Groq (STT + Fast): Ready")
-    print(f"{'✅' if SAMBANOVA_API_KEY else '⚠️'} SambaNova (Pro): {'Ready' if SAMBANOVA_API_KEY else 'Not configured'}")
+    print(f"✅ AssemblyAI: Ready")
+    print(f"✅ Groq: Ready")
+    print(f"\n🤖 Models:")
+    print(f"   • Fast: {GROQ_MODEL_FAST}")
+    print(f"   • Complex: {GROQ_MODEL_COMPLEX}")
     print(f"\n🌍 Languages: {', '.join([l.flag for l in LANGUAGES.values()])}")
     print("=" * 70 + "\n")
     
